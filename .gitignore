@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Build / release artifacts
+*.zip
+
+# Local SQLite (in case a dev DB lands in the tree)
+*.db
+*.db-wal
+*.db-shm
+
+# OS
+.DS_Store

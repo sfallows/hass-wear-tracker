@@ -1,0 +1,58 @@
+{
+  "config": {
+    "step": {
+      "bulk_confirm": {
+        "title": "Choose what to track",
+        "description": "Found: {summary}. Tick the domains you want to track lifetime usage for. binary_sensor is off by default (most aren't wear-tracking candidates)."
+      },
+      "discovery_mode": {
+        "title": "New devices",
+        "description": "What should happen when a new trackable entity appears later?",
+        "data": {
+          "discovery_mode": "Discovery mode"
+        }
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "Wear Tracker is already set up (only one instance is supported)."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Wear Tracker options",
+        "data": {
+          "discovery_mode": "Discovery mode for new devices",
+          "include_binary_sensors": "Include binary sensors in auto-tracking"
+        }
+      }
+    }
+  },
+  "selector": {
+    "discovery_mode": {
+      "options": {
+        "prompt": "Prompt me (Repair issue) for each new device",
+        "auto_track": "Automatically track every new device",
+        "off": "Don't track new devices (manual only)"
+      }
+    }
+  },
+  "issues": {
+    "new_device": {
+      "title": "Track {entity_id}?",
+      "fix_flow": {
+        "step": {
+          "init": {
+            "title": "New trackable device",
+            "description": "{entity_id} ({domain}) appeared. Track its lifetime usage?",
+            "menu_options": {
+              "track": "Track it",
+              "skip": "Skip for now",
+              "never": "Never track this domain"
+            }
+          }
+        }
+      }
+    }
+  }
+}

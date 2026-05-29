@@ -1,0 +1,7 @@
+[tool.pytest.ini_options]
+# Home Assistant's test fixtures (hass, enable_custom_integrations) are async;
+# auto mode lets pytest-asyncio resolve them without per-test marks.
+asyncio_mode = "auto"
+testpaths = ["tests"]
+# Put the repo root on sys.path so HA can import `custom_components.wear_tracker`.
+pythonpath = ["."]

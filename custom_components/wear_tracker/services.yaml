@@ -1,0 +1,82 @@
+reset:
+  fields:
+    entity_id:
+      required: true
+      example: light.kitchen_island
+      selector:
+        entity: {}
+    keep_history:
+      default: false
+      selector:
+        boolean: {}
+
+set_rated:
+  fields:
+    entity_id:
+      required: true
+      selector:
+        entity: {}
+    hours:
+      example: 25000
+      selector:
+        number:
+          min: 0
+          mode: box
+          unit_of_measurement: h
+    cycles:
+      example: 50000
+      selector:
+        number:
+          min: 0
+          mode: box
+
+export_log:
+  fields:
+    entity_id:
+      required: true
+      selector:
+        entity: {}
+    start:
+      required: true
+      selector:
+        datetime: {}
+    end:
+      required: true
+      selector:
+        datetime: {}
+    filename:
+      example: kitchen_2026.csv
+      selector:
+        text: {}
+
+recompute:
+  fields:
+    entity_id:
+      selector:
+        entity: {}
+
+disable:
+  fields:
+    entity_id:
+      required: true
+      selector:
+        entity: {}
+    disabled:
+      default: true
+      selector:
+        boolean: {}
+
+purge:
+  fields:
+    entity_id:
+      required: true
+      selector:
+        entity: {}
+
+purge_all:
+  fields:
+    confirm:
+      required: true
+      default: false
+      selector:
+        boolean: {}

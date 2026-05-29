@@ -71,12 +71,23 @@ Then pick a discovery mode for future new devices:
 |---|---|
 | `sensor.<name>_lifetime_hours` | Cumulative time the entity was in its "on" state |
 | `sensor.<name>_connected_hours` | Cumulative time the entity was reachable (not `unavailable`) |
-| `sensor.<name>_lifetime_cycles` | Total off→on transitions |
+| `sensor.<name>_lifetime_cycles` | Cumulative on-cycles (off→on, and recovered-from-unavailable→on; sub-2 s bounces excluded by default) |
 | `sensor.<name>_connection_drops` | Total available→unavailable transitions |
 | `sensor.<name>_duty_cycle_pct` | `lifetime_hours / connected_hours × 100` |
 | `sensor.<name>_wear_pct` | `lifetime_hours / rated_hours × 100` (if rated set) |
 | `sensor.<name>_flap_rate_1h` | Transitions in the last hour |
+| `sensor.<name>_flap_rate_24h` | Transitions per hour, averaged over the last 24 h |
+| `sensor.<name>_unavail_rate_1h` | Connection drops in the last hour |
 | `binary_sensor.<name>_health_alert` | True when flap rate is anomalously high |
+
+## Domain-specific notes
+
+Different domains wear differently, so the integration interprets state per-domain:
+
+- **Climate** — On-time keys off `attributes.hvac_action` (actively heating/cooling/drying/fan/preheating/defrosting), not the thermostat mode. A thermostat left in `heat` mode all winter will still read zero on-time on mild days when the compressor is idle.
+- **Cover** — On-time counts only when the motor is moving (`opening`/`closing`); sitting `open` doesn't accrue hours. For covers, `lifetime_cycles` is the wear signal worth watching.
+- **Water heater** — Home Assistant has no `hvac_action` equivalent for water heaters, so this integration counts "energized hours" (mode != `off`). Pair with a power sensor if you want true active-heating time.
+- **Media player** — `playing` and `buffering` count as on; brief buffering blips are filtered out by the 2 s debounce.
 
 ## Roadmap
 
