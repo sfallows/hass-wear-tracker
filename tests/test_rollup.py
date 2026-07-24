@@ -112,3 +112,47 @@ def test_wear_critical_fires_once_per_threshold():
 
     second = rollup.evaluate(conn, 1, NOW + 10, **_THRESHOLDS, **wear_args)
     assert second["wear_critical"] == []  # already fired, debounced ~forever
+
+
+def test_wear_critical_cycles_only_device_fires_at_all_thresholds():
+    """A cycles-rated device (no rated_hours) must still get wear_critical events
+    with metric 'cycles' and cycles:NN discriminators (rollup.py finding)."""
+    conn = _seed_conn()
+    conn.execute(
+        "INSERT INTO summary (entity_meta_id, lifetime_cycles, updated_ts) VALUES (1, ?, 0)",
+        (50000,),  # 50000 cycles against a 50000 rating -> 100%
+    )
+    wear_args = dict(rated_cycles=50000, wear_thresholds=(90, 95, 100), wear_debounce_s=10**12)
+
+    first = rollup.evaluate(conn, 1, NOW, **_THRESHOLDS, **wear_args)
+    crossed = first["wear_critical"]
+    assert {c["threshold"] for c in crossed} == {90, 95, 100}
+    assert all(c["metric"] == "cycles" for c in crossed)
+    assert all(c["rated"] == 50000 for c in crossed)
+
+    discriminators = [
+        r[0] for r in conn.execute(
+            "SELECT discriminator FROM events_fired WHERE event_kind='wear_critical' "
+            "ORDER BY discriminator"
+        ).fetchall()
+    ]
+    assert discriminators == ["cycles:100", "cycles:90", "cycles:95"]
+
+    second = rollup.evaluate(conn, 1, NOW + 10, **_THRESHOLDS, **wear_args)
+    assert second["wear_critical"] == []  # debounced
+
+
+def test_wear_critical_reports_both_metrics_when_both_rated():
+    conn = _seed_conn()
+    conn.execute(
+        "INSERT INTO summary (entity_meta_id, lifetime_seconds, lifetime_cycles, updated_ts) "
+        "VALUES (1, ?, ?, 0)",
+        (91 * 3600, 46000),  # 91% of 100h and 92% of 50000 cycles
+    )
+    result = rollup.evaluate(
+        conn, 1, NOW, **_THRESHOLDS,
+        rated_hours=100, rated_cycles=50000,
+        wear_thresholds=(90, 95, 100), wear_debounce_s=10**12,
+    )
+    metrics = {(c["metric"], c["threshold"]) for c in result["wear_critical"]}
+    assert metrics == {("hours", 90), ("cycles", 90)}

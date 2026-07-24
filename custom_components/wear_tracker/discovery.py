@@ -17,6 +17,7 @@ from .const import (
     CONF_EXCLUDED_ENTITIES,
     CONF_INCLUDE_BINARY_SENSORS,
     DISCOVERY_AUTO_TRACK,
+    DOMAIN,
     TRACKABLE_DOMAINS,
 )
 
@@ -36,6 +37,10 @@ def scan_trackable(
     found: list[str] = []
     for entry in ent_reg.entities.values():
         if entry.disabled:
+            continue
+        # Skip our own entities (health-alert binary sensors) so auto_track never
+        # tracks itself into an unbounded reload loop.
+        if entry.platform == DOMAIN:
             continue
         domain = entry.domain
         if domain not in TRACKABLE_DOMAINS:
@@ -60,14 +65,17 @@ def trackable_by_domain(hass: HomeAssistant) -> dict[str, list[str]]:
 @callback
 def resolve_tracked_entities(hass: HomeAssistant, options: dict) -> list[str]:
     """Compute the entity_ids to track from merged entry data/options."""
-    explicit = list(options.get(CONF_ENTITIES, []))
+    excluded_entities = set(options.get(CONF_EXCLUDED_ENTITIES, []))
+    # An explicit exclusion wins even over an explicit track entry, so a stale
+    # CONF_ENTITIES membership can't permanently override the exclusion.
+    explicit = [e for e in options.get(CONF_ENTITIES, []) if e not in excluded_entities]
     if options.get(CONF_DISCOVERY_MODE) == DISCOVERY_AUTO_TRACK:
         explicit.extend(
             scan_trackable(
                 hass,
                 include_binary_sensors=options.get(CONF_INCLUDE_BINARY_SENSORS, False),
                 excluded_domains=options.get(CONF_EXCLUDED_DOMAINS, []),
-                excluded_entities=set(options.get(CONF_EXCLUDED_ENTITIES, [])) | set(explicit),
+                excluded_entities=excluded_entities | set(explicit),
             )
         )
     seen: set[str] = set()

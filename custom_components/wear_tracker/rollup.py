@@ -118,24 +118,43 @@ def _wear_critical(
     meta_id: int,
     now_ts: int,
     rated_hours: float | None,
+    rated_cycles: int | None,
     thresholds: tuple[int, ...],
     debounce_s: int,
 ) -> list[dict[str, Any]]:
-    if not rated_hours:
+    """Threshold crossings against whichever rating(s) are set (DESIGN §10). Each
+    metric ('hours', 'cycles') is debounced independently via its discriminator."""
+    if not rated_hours and not rated_cycles:
         return []
     row = conn.execute(
-        "SELECT lifetime_seconds FROM summary WHERE entity_meta_id = ?", (meta_id,)
+        "SELECT lifetime_seconds, lifetime_cycles FROM summary WHERE entity_meta_id = ?",
+        (meta_id,),
     ).fetchone()
     if row is None:
         return []
-    hours = row["lifetime_seconds"] / 3600.0
-    pct = hours / rated_hours * 100.0
-    crossed = []
-    for threshold in thresholds:
-        if pct >= threshold and record_event_if_due(
-            conn, meta_id, "wear_critical", f"hours:{threshold}", now_ts, debounce_s
-        ):
-            crossed.append({"threshold": threshold, "value": round(hours, 2), "rated": rated_hours})
+    crossed: list[dict[str, Any]] = []
+    if rated_hours:
+        hours = row["lifetime_seconds"] / 3600.0
+        pct = hours / rated_hours * 100.0
+        for threshold in thresholds:
+            if pct >= threshold and record_event_if_due(
+                conn, meta_id, "wear_critical", f"hours:{threshold}", now_ts, debounce_s
+            ):
+                crossed.append(
+                    {"metric": "hours", "threshold": threshold,
+                     "value": round(hours, 2), "rated": rated_hours}
+                )
+    if rated_cycles:
+        cycles = row["lifetime_cycles"]
+        pct = cycles / rated_cycles * 100.0
+        for threshold in thresholds:
+            if pct >= threshold and record_event_if_due(
+                conn, meta_id, "wear_critical", f"cycles:{threshold}", now_ts, debounce_s
+            ):
+                crossed.append(
+                    {"metric": "cycles", "threshold": threshold,
+                     "value": int(cycles), "rated": rated_cycles}
+                )
     return crossed
 
 
@@ -153,6 +172,7 @@ def evaluate(
     conn_min: float,
     debounce_s: int,
     rated_hours: float | None = None,
+    rated_cycles: int | None = None,
     wear_thresholds: tuple[int, ...] = (),
     wear_debounce_s: int = 0,
 ) -> dict[str, Any]:
@@ -183,6 +203,7 @@ def evaluate(
             "baseline": base_unavail,
         },
         "wear_critical": _wear_critical(
-            conn, meta_id, now_ts, rated_hours, wear_thresholds, wear_debounce_s
+            conn, meta_id, now_ts, rated_hours, rated_cycles,
+            wear_thresholds, wear_debounce_s
         ),
     }

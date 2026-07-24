@@ -11,6 +11,7 @@ class TrackedEntity:
     unique_id: str | None
     entity_id: str
     domain: str
+    platform: str | None
     friendly_name: str | None
     manufacturer: str | None
     model: str | None
@@ -18,12 +19,14 @@ class TrackedEntity:
     rated_cycles: int | None
     tracking_since: int
     disabled: bool
+    disabled_reason: str | None
     debounce_s: float
 
 
 _COLUMNS = (
-    "id, unique_id, entity_id, domain, friendly_name, manufacturer, model, "
-    "rated_hours, rated_cycles, tracking_since, disabled, debounce_s"
+    "id, unique_id, entity_id, domain, platform, friendly_name, manufacturer, "
+    "model, rated_hours, rated_cycles, tracking_since, disabled, disabled_reason, "
+    "debounce_s"
 )
 
 
@@ -33,6 +36,7 @@ def _row_to_entity(row: sqlite3.Row) -> TrackedEntity:
         unique_id=row["unique_id"],
         entity_id=row["entity_id"],
         domain=row["domain"],
+        platform=row["platform"],
         friendly_name=row["friendly_name"],
         manufacturer=row["manufacturer"],
         model=row["model"],
@@ -40,8 +44,24 @@ def _row_to_entity(row: sqlite3.Row) -> TrackedEntity:
         rated_cycles=row["rated_cycles"],
         tracking_since=row["tracking_since"],
         disabled=bool(row["disabled"]),
+        disabled_reason=row["disabled_reason"],
         debounce_s=row["debounce_s"],
     )
+
+
+def wear_sensor_root(entity: TrackedEntity) -> str:
+    """Stable, collision-free root for this entity's sensor unique_ids.
+
+    HA unique_ids are only unique per (platform, domain); two tracked entities
+    that share a unique_id string across platforms would otherwise mint the same
+    sensor unique_ids and reject the second. Qualify with platform+domain (both
+    stable across renames and re-pairs). Legacy entities without a unique_id keep
+    the entity_id root, which is already unique per install."""
+    if entity.unique_id:
+        return "_".join(
+            p for p in (entity.platform, entity.domain, entity.unique_id) if p
+        )
+    return entity.entity_id
 
 
 def load_all(conn: sqlite3.Connection) -> list[TrackedEntity]:
@@ -76,11 +96,43 @@ def load_by_unique_id(
     return _row_to_entity(row) if row else None
 
 
+def load_by_identity(
+    conn: sqlite3.Connection,
+    platform: str | None,
+    domain: str,
+    unique_id: str,
+) -> TrackedEntity | None:
+    """Match on the composite HA guarantees unique: (platform, domain, unique_id).
+    `platform IS ?` binds NULL correctly for legacy rows without a platform."""
+    cur = conn.execute(
+        f"SELECT {_COLUMNS} FROM entity_meta "
+        "WHERE unique_id = ? AND domain = ? AND platform IS ?",
+        (unique_id, domain, platform),
+    )
+    row = cur.fetchone()
+    return _row_to_entity(row) if row else None
+
+
+def _resume_if_removed(
+    conn: sqlite3.Connection, row: TrackedEntity
+) -> TrackedEntity:
+    """Re-registering a soft-deleted row resumes tracking (DESIGN §4, Zigbee
+    re-pair). Only a removal-disable is cleared; a deliberate user disable stays."""
+    if row.disabled and row.disabled_reason == "removed":
+        conn.execute(
+            "UPDATE entity_meta SET disabled = 0, disabled_reason = NULL WHERE id = ?",
+            (row.id,),
+        )
+        return load_by_entity_id(conn, row.entity_id) or row
+    return row
+
+
 def _backfill(
     conn: sqlite3.Connection,
     row: TrackedEntity,
     *,
     unique_id: str | None = None,
+    platform: str | None = None,
     manufacturer: str | None = None,
     model: str | None = None,
     rated_hours: float | None = None,
@@ -89,6 +141,7 @@ def _backfill(
     """Fill in columns that are currently NULL (never overwrite a set value)."""
     candidates = {
         "unique_id": (unique_id, row.unique_id),
+        "platform": (platform, row.platform),
         "manufacturer": (manufacturer, row.manufacturer),
         "model": (model, row.model),
         "rated_hours": (rated_hours, row.rated_hours),
@@ -112,6 +165,7 @@ def upsert(
     domain: str,
     tracking_since: int,
     unique_id: str | None = None,
+    platform: str | None = None,
     friendly_name: str | None = None,
     manufacturer: str | None = None,
     model: str | None = None,
@@ -121,45 +175,55 @@ def upsert(
 ) -> TrackedEntity:
     """Insert if absent; return the persisted row.
 
-    `unique_id` is the durable key: if a row already has it (e.g. the entity was
-    renamed while we weren't listening, or a Zigbee device was re-paired), follow
-    that row and update its mutable `entity_id` label. Otherwise match on
-    `entity_id` and backfill `unique_id` if it was previously unknown.
+    Identity is the composite (platform, domain, unique_id) — the tuple HA keeps
+    unique — not the unique_id string alone, so two entities that share a
+    unique_id across platforms/domains stay distinct. If a row already matches
+    (e.g. the entity was renamed while we weren't listening, or a Zigbee device
+    was re-paired), follow that row and update its mutable `entity_id` label.
+    Otherwise match on `entity_id` and backfill identity if it was unknown.
+    Re-registering a removal-disabled row also resumes its tracking (DESIGN §4).
     """
     if unique_id is not None:
-        by_uid = load_by_unique_id(conn, unique_id)
-        if by_uid is not None:
-            if by_uid.entity_id != entity_id:
+        by_id = load_by_identity(conn, platform, domain, unique_id)
+        if by_id is None and platform is not None:
+            # Pre-v5 rows have platform NULL until first backfill; without this a
+            # rename during downtime would orphan the row and fork its history.
+            by_id = load_by_identity(conn, None, domain, unique_id)
+        if by_id is not None:
+            if by_id.entity_id != entity_id:
                 try:
                     conn.execute(
                         "UPDATE entity_meta SET entity_id = ? WHERE id = ?",
-                        (entity_id, by_uid.id),
+                        (entity_id, by_id.id),
                     )
                 except sqlite3.IntegrityError:
                     # entity_id already held by another row (rare rename swap).
-                    return by_uid
-                by_uid = load_by_entity_id(conn, entity_id) or by_uid
-            return _backfill(
-                conn, by_uid, manufacturer=manufacturer, model=model,
-                rated_hours=rated_hours, rated_cycles=rated_cycles,
+                    return _resume_if_removed(conn, by_id)
+                by_id = load_by_entity_id(conn, entity_id) or by_id
+            by_id = _backfill(
+                conn, by_id, platform=platform, manufacturer=manufacturer,
+                model=model, rated_hours=rated_hours, rated_cycles=rated_cycles,
             )
+            return _resume_if_removed(conn, by_id)
 
     existing = load_by_entity_id(conn, entity_id)
     if existing is not None:
-        return _backfill(
-            conn, existing, unique_id=unique_id, manufacturer=manufacturer,
-            model=model, rated_hours=rated_hours, rated_cycles=rated_cycles,
+        existing = _backfill(
+            conn, existing, unique_id=unique_id, platform=platform,
+            manufacturer=manufacturer, model=model, rated_hours=rated_hours,
+            rated_cycles=rated_cycles,
         )
+        return _resume_if_removed(conn, existing)
     conn.execute(
         """
         INSERT INTO entity_meta (
-            unique_id, entity_id, domain, friendly_name,
+            unique_id, entity_id, domain, platform, friendly_name,
             manufacturer, model, rated_hours, rated_cycles,
             tracking_since, debounce_s
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            unique_id, entity_id, domain, friendly_name,
+            unique_id, entity_id, domain, platform, friendly_name,
             manufacturer, model, rated_hours, rated_cycles,
             tracking_since, debounce_s,
         ),
@@ -171,11 +235,17 @@ def upsert(
 
 
 def set_disabled(
-    conn: sqlite3.Connection, entity_id: str, disabled: bool
+    conn: sqlite3.Connection,
+    entity_id: str,
+    disabled: bool,
+    reason: str | None = None,
 ) -> None:
+    """Set the disabled flag and (when disabling) record why: 'removed' for a
+    registry soft-delete that later resumes, 'user' for a deliberate disable that
+    stays sticky across restarts. Re-enabling clears the reason."""
     conn.execute(
-        "UPDATE entity_meta SET disabled = ? WHERE entity_id = ?",
-        (1 if disabled else 0, entity_id),
+        "UPDATE entity_meta SET disabled = ?, disabled_reason = ? WHERE entity_id = ?",
+        (1 if disabled else 0, reason if disabled else None, entity_id),
     )
 
 
@@ -187,6 +257,8 @@ def reconcile_rename(
     old_entity_id: str,
     new_entity_id: str,
     target_unique_id: str | None,
+    target_platform: str | None = None,
+    target_domain: str | None = None,
 ) -> list[tuple[str, str]]:
     """Make `new_entity_id` belong to the row for `target_unique_id` (falling back
     to `old_entity_id` for rows that predate unique_id tracking).
@@ -202,7 +274,13 @@ def reconcile_rename(
     """
     row = None
     if target_unique_id is not None:
-        row = load_by_unique_id(conn, target_unique_id)
+        # Prefer the composite identity so a unique_id shared across platforms
+        # doesn't move the wrong row; fall back to unique_id-only when the caller
+        # can't supply the domain (older callers / tests).
+        if target_domain is not None:
+            row = load_by_identity(conn, target_platform, target_domain, target_unique_id)
+        else:
+            row = load_by_unique_id(conn, target_unique_id)
     if row is None:
         row = load_by_entity_id(conn, old_entity_id)
     if row is None or row.entity_id == new_entity_id:

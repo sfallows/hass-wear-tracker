@@ -74,6 +74,23 @@ def test_upsert_follows_unique_id_across_rename_while_down():
     assert registry.load_by_entity_id(conn, "light.old") is None
 
 
+def test_upsert_matches_legacy_null_platform_row_after_rename():
+    """A pre-v5 row (platform NULL until first backfill) that was renamed during
+    downtime must still be matched by identity, not forked into a new row."""
+    conn = _seed_conn()
+    legacy = registry.upsert(
+        conn, entity_id="light.old", domain="light", tracking_since=1, unique_id="uid-1"
+    )
+    again = registry.upsert(
+        conn, entity_id="light.new", domain="light", tracking_since=1,
+        unique_id="uid-1", platform="hue",
+    )
+    assert again.id == legacy.id
+    assert again.entity_id == "light.new"
+    assert again.platform == "hue"
+    assert conn.execute("SELECT COUNT(*) FROM entity_meta").fetchone()[0] == 1
+
+
 def test_reconcile_rename_moves_label_and_keeps_id():
     conn = _seed_conn()
     before = registry.upsert(
@@ -99,6 +116,89 @@ def test_reconcile_rename_noop_when_already_correct():
         conn, entity_id="light.a", domain="light", tracking_since=1, unique_id="uid-a"
     )
     assert registry.reconcile_rename(conn, "light.a", "light.a", "uid-a") == []
+
+
+def test_same_unique_id_across_platforms_stays_two_entities():
+    """A unique_id is only unique per (platform, domain); two entities that share
+    one must not merge into a single entity_meta row (registry.py finding)."""
+    conn = _seed_conn()
+    a = registry.upsert(
+        conn, entity_id="switch.plug", domain="switch", tracking_since=1,
+        unique_id="abc", platform="tplink",
+    )
+    b = registry.upsert(
+        conn, entity_id="light.lamp", domain="light", tracking_since=1,
+        unique_id="abc", platform="hue",
+    )
+    assert a.id != b.id
+    assert conn.execute("SELECT COUNT(*) FROM entity_meta").fetchone()[0] == 2
+    assert registry.load_by_entity_id(conn, "switch.plug").id == a.id
+    assert registry.load_by_entity_id(conn, "light.lamp").id == b.id
+    # And their sensor roots differ, so their sensor unique_ids can't collide.
+    assert registry.wear_sensor_root(a) != registry.wear_sensor_root(b)
+
+
+def test_wear_sensor_root_falls_back_to_entity_id_without_unique_id():
+    conn = _seed_conn()
+    row = registry.upsert(conn, entity_id="fan.attic", domain="fan", tracking_since=1)
+    assert registry.wear_sensor_root(row) == "fan.attic"
+
+
+def test_removal_disabled_row_resumes_on_reupsert():
+    """DESIGN §4: a soft-deleted (removed) row resumes tracking when the same
+    unique_id re-registers (Zigbee re-pair)."""
+    conn = _seed_conn()
+    row = registry.upsert(
+        conn, entity_id="light.a", domain="light", tracking_since=1,
+        unique_id="uid-a", platform="hue",
+    )
+    registry.set_disabled(conn, "light.a", True, "removed")
+    assert registry.load_by_entity_id(conn, "light.a").disabled is True
+
+    again = registry.upsert(
+        conn, entity_id="light.a", domain="light", tracking_since=2,
+        unique_id="uid-a", platform="hue",
+    )
+    assert again.id == row.id  # same history row
+    assert again.disabled is False
+    assert again.disabled_reason is None
+
+
+def test_user_disabled_row_stays_disabled_on_reupsert():
+    """A deliberate wear_tracker.disable stays sticky across a restart/reload."""
+    conn = _seed_conn()
+    row = registry.upsert(
+        conn, entity_id="light.a", domain="light", tracking_since=1,
+        unique_id="uid-a", platform="hue",
+    )
+    registry.set_disabled(conn, "light.a", True, "user")
+    again = registry.upsert(
+        conn, entity_id="light.a", domain="light", tracking_since=2,
+        unique_id="uid-a", platform="hue",
+    )
+    assert again.id == row.id
+    assert again.disabled is True
+    assert again.disabled_reason == "user"
+
+
+def test_reconcile_rename_disambiguates_shared_unique_id():
+    """When two rows share a unique_id across platforms, a rename must move the row
+    matching the full (platform, domain, unique_id), not the first uid match."""
+    conn = _seed_conn()
+    a = registry.upsert(
+        conn, entity_id="switch.plug", domain="switch", tracking_since=1,
+        unique_id="abc", platform="tplink",
+    )
+    b = registry.upsert(
+        conn, entity_id="light.lamp", domain="light", tracking_since=1,
+        unique_id="abc", platform="hue",
+    )
+    moves = registry.reconcile_rename(
+        conn, "light.lamp", "light.lamp2", "abc", "hue", "light"
+    )
+    assert moves == [("light.lamp", "light.lamp2")]
+    assert registry.load_by_entity_id(conn, "light.lamp2").id == b.id
+    assert registry.load_by_entity_id(conn, "switch.plug").id == a.id  # untouched
 
 
 def test_reconcile_rename_handles_simultaneous_swap():
@@ -237,6 +337,66 @@ def test_reset_zeroes_summary_and_drops_history():
     assert conn.execute("SELECT COUNT(*) FROM transitions").fetchone()[0] == 0
 
 
+def test_reset_clears_events_fired():
+    conn = _seed_conn()
+    row = registry.upsert(conn, entity_id="light.a", domain="light", tracking_since=1)
+    storage.write_transition_sync(conn, row.id, _transition(StateKind.ON, life=10.0, cycles=1))
+    conn.execute(
+        "INSERT INTO events_fired (entity_meta_id, event_kind, discriminator, fired_ts)"
+        " VALUES (?, 'wear_critical', 'hours:90', 1500)",
+        (row.id,),
+    )
+    # Cleared even with keep_history so wear_critical can re-arm for a replaced device.
+    storage.reset_summary_sync(conn, row.id, keep_history=True, ts=2000)
+    remaining = conn.execute(
+        "SELECT COUNT(*) FROM events_fired WHERE entity_meta_id=?", (row.id,)
+    ).fetchone()[0]
+    assert remaining == 0
+
+
+def test_recompute_after_keep_history_reset_does_not_resurrect():
+    conn = _seed_conn()
+    row = registry.upsert(conn, entity_id="light.a", domain="light", tracking_since=1)
+    storage.write_transition_sync(conn, row.id, _transition(StateKind.ON, life=50.0, cycles=1))
+    _raw_transition(conn, row.id, 300, "OFF", "DISCONNECTED", 30.0)  # a pre-reset drop
+    prior = storage.reset_summary_sync(conn, row.id, keep_history=True, ts=2000)
+    assert prior["lifetime_seconds"] == 50.0
+    # History (all ts < 2000) is retained but must not be replayed into the summary.
+    assert conn.execute("SELECT COUNT(*) FROM transitions").fetchone()[0] > 0
+    new = storage.recompute_summary_sync(conn, row.id, 2.0)
+    assert new["lifetime_seconds"] == 0.0
+    assert new["lifetime_cycles"] == 0
+    assert new["connection_drops"] == 0
+
+
+def test_recompute_ignores_restart_seed_disconnect_rows():
+    conn = _seed_conn()
+    row = registry.upsert(conn, entity_id="light.a", domain="light", tracking_since=1)
+    storage.write_transition_sync(conn, row.id, _transition(StateKind.ON, life=0.0))
+    _raw_transition(conn, row.id, 100, "ON", "DISCONNECTED", 5.0)  # one real drop
+    # Three restart-while-unavailable seed rows (D->D, zero delta) — not drops.
+    _raw_transition(conn, row.id, 200, "DISCONNECTED", "DISCONNECTED", 0.0)
+    _raw_transition(conn, row.id, 300, "DISCONNECTED", "DISCONNECTED", 0.0)
+    _raw_transition(conn, row.id, 400, "DISCONNECTED", "DISCONNECTED", 0.0)
+    new = storage.recompute_summary_sync(conn, row.id, 2.0)
+    assert new["connection_drops"] == 1
+
+
+def test_fold_ignores_restart_seed_disconnect_rows():
+    conn = _seed_conn()
+    row = registry.upsert(conn, entity_id="light.a", domain="light", tracking_since=1)
+    old = 1_600_000_000
+    _raw_transition(conn, row.id, old, "ON", "DISCONNECTED", 5.0)  # one real drop
+    _raw_transition(conn, row.id, old + 1, "DISCONNECTED", "DISCONNECTED", 0.0)  # seed
+    _raw_transition(conn, row.id, old + 2, "DISCONNECTED", "DISCONNECTED", 0.0)  # seed
+    purged = storage.fold_and_purge_sync(conn, cutoff_ts=old + 100, debounce_s=2.0)
+    assert purged == 3
+    daily = conn.execute(
+        "SELECT SUM(drops) d FROM daily_summary WHERE entity_meta_id=?", (row.id,)
+    ).fetchone()
+    assert daily["d"] == 1
+
+
 def test_purge_entity_removes_all_rows():
     conn = _seed_conn()
     row = registry.upsert(conn, entity_id="light.a", domain="light", tracking_since=1)
@@ -259,4 +419,4 @@ def test_migrations_set_schema_version(tmp_path):
         finally:
             await writer.close()
 
-    assert asyncio.run(scenario()) == "3"
+    assert asyncio.run(scenario()) == "5"

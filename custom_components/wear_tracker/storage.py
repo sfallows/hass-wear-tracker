@@ -64,19 +64,29 @@ class AsyncSqliteWriter:
             current_version = int(row[0]) if row else 0
 
         migrations = sorted(MIGRATIONS_DIR.glob("[0-9][0-9]_*.sql"))
-        for path in migrations:
-            num = int(path.name[:2])
-            if num <= current_version:
-                continue
-            _LOG.info("wear_tracker: applying migration %s", path.name)
-            self._conn.executescript(path.read_text("utf-8"))
-            self._conn.execute(
-                """
-                INSERT INTO meta(key, value) VALUES ('schema_version', ?)
-                ON CONFLICT(key) DO UPDATE SET value = excluded.value
-                """,
-                (str(num),),
-            )
+        pending = [p for p in migrations if int(p.name[:2]) > current_version]
+        if not pending:
+            return
+        # Disable FK enforcement while migrating: a table-rebuild migration must be
+        # able to DROP the old parent table without cascade-deleting history rows.
+        # Toggle in autocommit (a PRAGMA is a no-op inside a transaction), then
+        # restore ON so live cascades (purge) work. Surrogate ids are preserved
+        # across rebuilds so the restored constraint stays satisfied.
+        self._conn.execute("PRAGMA foreign_keys = OFF")
+        try:
+            for path in pending:
+                num = int(path.name[:2])
+                _LOG.info("wear_tracker: applying migration %s", path.name)
+                self._conn.executescript(path.read_text("utf-8"))
+                self._conn.execute(
+                    """
+                    INSERT INTO meta(key, value) VALUES ('schema_version', ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (str(num),),
+                )
+        finally:
+            self._conn.execute("PRAGMA foreign_keys = ON")
 
     async def close(self) -> None:
         if self._closed:
@@ -278,11 +288,15 @@ def reset_summary_sync(
             """
             UPDATE summary SET lifetime_seconds = 0, connected_seconds = 0,
                 lifetime_cycles = 0, connection_drops = 0,
-                last_state = NULL, last_change_ts = NULL, updated_ts = ?
+                last_state = NULL, last_change_ts = NULL,
+                reset_ts = ?, updated_ts = ?
             WHERE entity_meta_id = ?
             """,
-            (ts, entity_meta_id),
+            (ts, ts, entity_meta_id),
         )
+        # Re-arm event debounce: WEAR_CRITICAL_DEBOUNCE_S is effectively infinite,
+        # so a stale fired_ts would suppress wear_critical for the replaced device.
+        conn.execute("DELETE FROM events_fired WHERE entity_meta_id = ?", (entity_meta_id,))
         if not keep_history:
             conn.execute("DELETE FROM transitions WHERE entity_meta_id = ?", (entity_meta_id,))
             conn.execute("DELETE FROM daily_summary WHERE entity_meta_id = ?", (entity_meta_id,))
@@ -315,31 +329,41 @@ def recompute_summary_sync(
     conn: sqlite3.Connection, entity_meta_id: int, debounce_s: float
 ) -> dict[str, Any]:
     """Rebuild summary from daily_summary + remaining transitions. Never lowers a
-    counter below its current value (a total_increasing series mustn't drop)."""
+    counter below its current value (a total_increasing series mustn't drop).
+    History before the entity's last reset is ignored so a reset survives recompute."""
+    reset_row = conn.execute(
+        "SELECT COALESCE(reset_ts, 0) FROM summary WHERE entity_meta_id = ?",
+        (entity_meta_id,),
+    ).fetchone()
+    reset_ts = reset_row[0] if reset_row else 0
     daily = conn.execute(
         """
         SELECT COALESCE(SUM(on_seconds), 0) AS life, COALESCE(SUM(connected_seconds), 0) AS conn,
                COALESCE(SUM(cycles), 0) AS cyc, COALESCE(SUM(drops), 0) AS drops
         FROM daily_summary WHERE entity_meta_id = ?
+          AND day >= strftime('%Y-%m-%d', ?, 'unixepoch')
         """,
-        (entity_meta_id,),
+        (entity_meta_id, reset_ts),
     ).fetchone()
     life = daily["life"] + conn.execute(
-        "SELECT COALESCE(SUM(delta_s), 0) FROM transitions WHERE entity_meta_id = ? AND from_state = 'ON'",
-        (entity_meta_id,),
+        "SELECT COALESCE(SUM(delta_s), 0) FROM transitions WHERE entity_meta_id = ? AND from_state = 'ON' AND ts >= ?",
+        (entity_meta_id, reset_ts),
     ).fetchone()[0]
     connected = daily["conn"] + conn.execute(
-        "SELECT COALESCE(SUM(delta_s), 0) FROM transitions WHERE entity_meta_id = ? AND from_state != 'DISCONNECTED'",
-        (entity_meta_id,),
+        "SELECT COALESCE(SUM(delta_s), 0) FROM transitions WHERE entity_meta_id = ? AND from_state != 'DISCONNECTED' AND ts >= ?",
+        (entity_meta_id, reset_ts),
     ).fetchone()[0]
     cycles = daily["cyc"] + conn.execute(
         "SELECT COUNT(*) FROM transitions WHERE entity_meta_id = ? AND to_state = 'ON' "
-        "AND from_state IN ('OFF', 'DISCONNECTED') AND delta_s >= ?",
-        (entity_meta_id, debounce_s),
+        "AND from_state IN ('OFF', 'DISCONNECTED') AND delta_s >= ? AND ts >= ?",
+        (entity_meta_id, debounce_s, reset_ts),
     ).fetchone()[0]
+    # from_state != 'DISCONNECTED' excludes restart seed rows (D->D, drops_delta=0),
+    # which the live counter never counts as a connection drop.
     drops = daily["drops"] + conn.execute(
-        "SELECT COUNT(*) FROM transitions WHERE entity_meta_id = ? AND to_state = 'DISCONNECTED'",
-        (entity_meta_id,),
+        "SELECT COUNT(*) FROM transitions WHERE entity_meta_id = ? AND to_state = 'DISCONNECTED' "
+        "AND from_state != 'DISCONNECTED' AND ts >= ?",
+        (entity_meta_id, reset_ts),
     ).fetchone()[0]
     current = load_summary_sync(conn, entity_meta_id) or {}
     new = {
@@ -378,7 +402,7 @@ def fold_and_purge_sync(
                    COALESCE(SUM(CASE WHEN from_state = 'ON' THEN delta_s ELSE 0 END), 0) AS on_seconds,
                    COALESCE(SUM(CASE WHEN from_state != 'DISCONNECTED' THEN delta_s ELSE 0 END), 0) AS connected_seconds,
                    COALESCE(SUM(CASE WHEN to_state = 'ON' AND from_state IN ('OFF', 'DISCONNECTED') AND delta_s >= ? THEN 1 ELSE 0 END), 0) AS cycles,
-                   COALESCE(SUM(CASE WHEN to_state = 'DISCONNECTED' THEN 1 ELSE 0 END), 0) AS drops
+                   COALESCE(SUM(CASE WHEN to_state = 'DISCONNECTED' AND from_state != 'DISCONNECTED' THEN 1 ELSE 0 END), 0) AS drops
             FROM transitions WHERE ts < ?
             GROUP BY entity_meta_id, day
             """,

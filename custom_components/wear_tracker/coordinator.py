@@ -22,6 +22,7 @@ from homeassistant.helpers.event import (
     async_track_state_change_event,
     async_track_time_interval,
 )
+from homeassistant.helpers.start import async_at_started
 
 from . import events, registry, repairs, rollup, storage
 from .catalog import lookup_rated
@@ -33,12 +34,14 @@ from .const import (
     CONF_DISCOVERY_MODE,
     CONF_ENTITIES,
     CONF_EXCLUDED_DOMAINS,
+    CONF_EXCLUDED_ENTITIES,
     CONF_INCLUDE_BINARY_SENSORS,
     CONNECTION_MIN_PER_HOUR,
     CONNECTION_RATIO,
     DEFAULT_DEBOUNCE_S,
     DISCOVERY_AUTO_TRACK,
     DISCOVERY_PROMPT,
+    DOMAIN,
     EVENT_WEAR_CRITICAL,
     FLAP_MIN_PER_HOUR,
     FLAP_RATIO,
@@ -78,13 +81,18 @@ class WearCoordinator:
         self._shutdown_started = False
         self._discovery_mode = DISCOVERY_PROMPT
         self._excluded_domains: set[str] = set()
+        self._excluded_entities: set[str] = set()
         self._include_binary_sensors = False
         self._rates: dict[int, dict[str, float]] = {}
         self._health: dict[int, bool] = {}
+        # Accruals whose persist failed on a prior tick; retried next tick so a
+        # transient write error can't permanently drop already-flushed on-time.
+        self._pending_accruals: list[tuple[int, float, float]] = []
         self._unsub_state: Callable[[], None] | None = None
         self._unsub_heartbeat: Callable[[], None] | None = None
         self._unsub_registry: Callable[[], None] | None = None
         self._unsub_retention: Callable[[], None] | None = None
+        self._unsub_started: Callable[[], None] | None = None
 
     async def async_start(self, entity_ids: list[str]) -> None:
         now_ts = int(time.time())
@@ -92,6 +100,7 @@ class WearCoordinator:
             options = self.entry.options
             self._discovery_mode = options.get(CONF_DISCOVERY_MODE, DISCOVERY_PROMPT)
             self._excluded_domains = set(options.get(CONF_EXCLUDED_DOMAINS, []))
+            self._excluded_entities = set(options.get(CONF_EXCLUDED_ENTITIES, []))
             self._include_binary_sensors = options.get(CONF_INCLUDE_BINARY_SENSORS, False)
         ent_reg = er.async_get(self.hass)
         dev_reg = dr.async_get(self.hass)
@@ -102,6 +111,7 @@ class WearCoordinator:
             friendly = state.attributes.get("friendly_name") if state else None
             entry = ent_reg.async_get(eid)
             unique_id = entry.unique_id if entry else None
+            platform = entry.platform if entry else None
             device = self._source_device_entry(dev_reg, entry)
             manufacturer = device.manufacturer if device else None
             model = device.model if device else None
@@ -113,13 +123,14 @@ class WearCoordinator:
             rated_cycles = rated.rated_cycles if rated else None
             tracked = await self.writer.run(
                 lambda conn, eid=eid, domain=domain, friendly=friendly, unique_id=unique_id,
-                manufacturer=manufacturer, model=model, rated_hours=rated_hours,
-                rated_cycles=rated_cycles: registry.upsert(
+                platform=platform, manufacturer=manufacturer, model=model,
+                rated_hours=rated_hours, rated_cycles=rated_cycles: registry.upsert(
                     conn,
                     entity_id=eid,
                     domain=domain,
                     friendly_name=friendly,
                     unique_id=unique_id,
+                    platform=platform,
                     manufacturer=manufacturer,
                     model=model,
                     rated_hours=rated_hours,
@@ -129,9 +140,33 @@ class WearCoordinator:
             )
             self._tracked[eid] = tracked
 
+        self._unsub_registry = self.hass.bus.async_listen(
+            er.EVENT_ENTITY_REGISTRY_UPDATED, self._handle_registry_event
+        )
+        self._unsub_retention = async_track_time_interval(
+            self.hass,
+            self._handle_retention,
+            timedelta(seconds=RETENTION_INTERVAL_S),
+        )
+        # Seeding must observe real source states; at boot those load *after* us,
+        # so gate on HA-started (fires immediately if already running). Seeding a
+        # machine DISCONNECTED here would fabricate a cycle when the real ON state
+        # arrives, and rob _recover_open_period of its restart on-time credit.
+        self._unsub_started = async_at_started(self.hass, self._schedule_seed)
+
+    @callback
+    def _schedule_seed(self, _hass: HomeAssistant) -> None:
+        # Run seeding as a tracked task so async_shutdown awaits it before closing
+        # the writer (it fires as an eager task that could otherwise outlive it).
+        self._track_task(self._async_seed_on_started())
+
+    async def _async_seed_on_started(self) -> None:
+        if self._shutdown_started:
+            return
+        now_ts = int(time.time())
         last_alive = await self.writer.load_last_alive()
         mono = time.monotonic()
-        for eid, tracked in self._tracked.items():
+        for eid, tracked in list(self._tracked.items()):
             state = self.hass.states.get(eid)
             logical = derive_logical_state(state)
             raw = state.state if state else None
@@ -142,19 +177,19 @@ class WearCoordinator:
             if ev is not None:
                 await self.writer.write_transition(tracked.id, ev)
 
+        # Stamp a fresh heartbeat now that the restart-gap credit is applied, so a
+        # second restart within the tolerance window recomputes the gap from this
+        # boot rather than re-crediting the same downtime off the stale last_alive.
+        await self.writer.heartbeat(now_ts)
+        # async_shutdown may have run its unsub pass during the awaits above;
+        # installing subscriptions after it would leak them.
+        if self._shutdown_started:
+            return
         self._resubscribe_state()
-        self._unsub_registry = self.hass.bus.async_listen(
-            er.EVENT_ENTITY_REGISTRY_UPDATED, self._handle_registry_event
-        )
         self._unsub_heartbeat = async_track_time_interval(
             self.hass,
             self._handle_heartbeat,
             timedelta(seconds=HEARTBEAT_INTERVAL_S),
-        )
-        self._unsub_retention = async_track_time_interval(
-            self.hass,
-            self._handle_retention,
-            timedelta(seconds=RETENTION_INTERVAL_S),
         )
         await self._run_rollup(int(time.time()))
 
@@ -208,19 +243,25 @@ class WearCoordinator:
 
     @callback
     def _handle_state_change(self, event: Event) -> None:
-        new_state = event.data.get("new_state")
-        if new_state is None:
-            return
         entity_id: str = event.data["entity_id"]
         tracked = self._tracked.get(entity_id)
         if tracked is None or tracked.disabled:
             return
 
+        new_state = event.data.get("new_state")
         logical = derive_logical_state(new_state)
-        ts = int(new_state.last_updated.timestamp())
+        if new_state is not None:
+            ts = int(new_state.last_updated.timestamp())
+            raw = new_state.state
+        else:
+            # Entity dropped out of the state machine (source integration reloaded
+            # or disabled). Treat as a disconnect so accrual stops instead of the
+            # in-memory machine staying ON and racking up phantom on-time.
+            ts = int(time.time())
+            raw = None
         mono = time.monotonic()
         ev = self.state_machine.observe(
-            entity_id, logical, new_state.state, ts, mono, tracked.debounce_s
+            entity_id, logical, raw, ts, mono, tracked.debounce_s
         )
         if ev is None:
             return
@@ -248,12 +289,16 @@ class WearCoordinator:
 
     async def _handle_heartbeat(self, _now) -> None:
         ts = int(time.time())
-        accruals = self._collect_accruals(time.monotonic())
+        # flush() has already advanced the machines' credit anchors, so include
+        # any deltas a prior tick failed to persist — otherwise they're lost.
+        accruals = self._pending_accruals + self._collect_accruals(time.monotonic())
+        self._pending_accruals = []
         if accruals:
             try:
                 await self.writer.apply_accruals(accruals, ts)
             except Exception:
                 _LOG.exception("wear_tracker: heartbeat accrual flush failed")
+                self._pending_accruals = accruals
         await self.writer.heartbeat(ts)
         await self._run_rollup(ts)
 
@@ -266,7 +311,8 @@ class WearCoordinator:
             meta_id = tracked.id
             try:
                 result = await self.writer.run(
-                    lambda conn, mid=meta_id, rh=tracked.rated_hours: rollup.evaluate(
+                    lambda conn, mid=meta_id, rh=tracked.rated_hours,
+                    rc=tracked.rated_cycles: rollup.evaluate(
                         conn,
                         mid,
                         now_ts,
@@ -279,6 +325,7 @@ class WearCoordinator:
                         conn_min=CONNECTION_MIN_PER_HOUR,
                         debounce_s=ANOMALY_DEBOUNCE_S,
                         rated_hours=rh,
+                        rated_cycles=rc,
                         wear_thresholds=WEAR_CRITICAL_THRESHOLDS,
                         wear_debounce_s=WEAR_CRITICAL_DEBOUNCE_S,
                     )
@@ -304,7 +351,7 @@ class WearCoordinator:
                     EVENT_WEAR_CRITICAL,
                     {
                         "entity_id": entity_id,
-                        "metric": "hours",
+                        "metric": crossing["metric"],
                         "pct": crossing["threshold"],
                         "value": crossing["value"],
                         "rated": crossing["rated"],
@@ -344,10 +391,17 @@ class WearCoordinator:
     async def _handle_entity_created(self, entity_id: str | None) -> None:
         if not entity_id or entity_id in self._tracked:
             return
+        if entity_id in self._excluded_entities:
+            return
         domain = entity_id.split(".", 1)[0]
         if domain not in TRACKABLE_DOMAINS or domain in self._excluded_domains:
             return
         if domain == "binary_sensor" and not self._include_binary_sensors:
+            return
+        # Never track our own entities (e.g. binary_sensor.*_health_alert): doing
+        # so would spawn sensors that re-trigger discovery in an unbounded loop.
+        reg_entry = er.async_get(self.hass).async_get(entity_id)
+        if reg_entry is not None and reg_entry.platform == DOMAIN:
             return
         if self._discovery_mode == DISCOVERY_AUTO_TRACK:
             await self.async_add_tracked_entities([entity_id])
@@ -372,9 +426,12 @@ class WearCoordinator:
             return
         entry = er.async_get(self.hass).async_get(new_entity_id)
         target_uid = entry.unique_id if entry else None
+        target_platform = entry.platform if entry else None
+        target_domain = entry.domain if entry else new_entity_id.split(".", 1)[0]
         moves = await self.writer.run(
             lambda conn: registry.reconcile_rename(
-                conn, old_entity_id, new_entity_id, target_uid
+                conn, old_entity_id, new_entity_id, target_uid,
+                target_platform, target_domain,
             )
         )
         if not moves:
@@ -404,7 +461,7 @@ class WearCoordinator:
         if tracked is None:
             return
         await self.writer.run(
-            lambda conn: registry.set_disabled(conn, entity_id, True)
+            lambda conn: registry.set_disabled(conn, entity_id, True, "removed")
         )
         self.state_machine.reset(entity_id)
         self._source_device.pop(entity_id, None)
@@ -423,16 +480,19 @@ class WearCoordinator:
             self._unsub_heartbeat,
             self._unsub_registry,
             self._unsub_retention,
+            self._unsub_started,
         ):
             if unsub is not None:
                 unsub()
         self._unsub_state = self._unsub_heartbeat = None
         self._unsub_registry = self._unsub_retention = None
+        self._unsub_started = None
         ts = int(time.time())
         if self._pending:
             await asyncio.gather(*list(self._pending), return_exceptions=True)
         try:
-            accruals = self._collect_accruals(time.monotonic())
+            accruals = self._pending_accruals + self._collect_accruals(time.monotonic())
+            self._pending_accruals = []
             if accruals:
                 await self.writer.apply_accruals(accruals, ts)
         except Exception:

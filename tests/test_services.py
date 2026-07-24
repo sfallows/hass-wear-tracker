@@ -1,11 +1,14 @@
 """Admin service round-trips through real Home Assistant."""
 from __future__ import annotations
 
+from unittest.mock import MagicMock, patch
+
 import pytest
 
 pytest.importorskip("pytest_homeassistant_custom_component")
 
 from homeassistant.core import SupportsResponse  # noqa: E402
+from homeassistant.helpers import entity_registry as er  # noqa: E402
 from pytest_homeassistant_custom_component.common import MockConfigEntry  # noqa: E402
 
 DOMAIN = "wear_tracker"
@@ -102,3 +105,67 @@ async def test_purge_all_requires_confirm(hass, enable_custom_integrations):
         DOMAIN, "purge_all", {"confirm": True}, blocking=True, return_response=True
     )
     assert result["purged"] >= 1
+
+
+async def test_reset_clears_only_own_lts(hass, enable_custom_integrations):
+    # switch.pump's unique-id root is a prefix of switch.pump_2's (HA's duplicate
+    # naming); resetting switch.pump must not wipe switch.pump_2's statistics.
+    await _setup(hass, entities=("switch.pump", "switch.pump_2"))
+    coordinator = hass.data[DOMAIN][next(iter(hass.data[DOMAIN]))]
+
+    cleared: list[str] = []
+    recorder_instance = MagicMock()
+    recorder_instance.async_clear_statistics.side_effect = cleared.extend
+
+    from custom_components.wear_tracker.services import _clear_lts
+
+    with patch(
+        "homeassistant.components.recorder.get_instance",
+        return_value=recorder_instance,
+    ):
+        await _clear_lts(hass, coordinator, "switch.pump")
+
+    reg = er.async_get(hass)
+    cleared_uids = {reg.async_get(eid).unique_id for eid in cleared}
+
+    assert "wear_tracker_switch.pump_lifetime_hours" in cleared_uids
+    assert not any(uid.startswith("wear_tracker_switch.pump_2_") for uid in cleared_uids)
+
+
+async def test_purge_does_not_resurrect_entity(hass, enable_custom_integrations):
+    entry, _coordinator = await _setup(hass, entities=("light.kitchen", "switch.fan"))
+    await hass.services.async_call(
+        DOMAIN, "purge", {"entity_id": "light.kitchen"}, blocking=True
+    )
+    await hass.async_block_till_done()
+
+    coordinator = hass.data[DOMAIN][next(iter(hass.data[DOMAIN]))]
+    assert coordinator.get_tracked("light.kitchen") is None
+    assert coordinator.get_tracked("switch.fan") is not None
+    assert "light.kitchen" not in entry.options["entities"]
+
+
+async def test_purge_in_auto_track_excludes_entity(hass, enable_custom_integrations):
+    """Residual purge finding: in auto_track, scan_trackable would re-discover a
+    still-existing entity on the post-purge reload; purge must exclude it to stick."""
+    er.async_get(hass).async_get_or_create(
+        "switch", "demo", "uid-pump", suggested_object_id="pump"
+    )
+    hass.states.async_set("switch.pump", "on")
+    entry = MockConfigEntry(
+        domain=DOMAIN, data={}, options={"entities": [], "discovery_mode": "auto_track"}
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+    assert "switch.pump" in coordinator.tracked_entity_ids()
+
+    await hass.services.async_call(
+        DOMAIN, "purge", {"entity_id": "switch.pump"}, blocking=True
+    )
+    await hass.async_block_till_done()
+
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+    assert "switch.pump" not in coordinator.tracked_entity_ids()
+    assert "switch.pump" in entry.options.get("excluded_entities", [])

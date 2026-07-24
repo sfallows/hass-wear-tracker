@@ -24,7 +24,16 @@ from homeassistant.helpers.service import async_register_admin_service
 from homeassistant.util import dt as dt_util
 
 from . import registry, storage
-from .const import DB_SUBDIR, DEFAULT_DEBOUNCE_S, DOMAIN, SIGNAL_WEAR_UPDATED
+from .const import (
+    CONF_DISCOVERY_MODE,
+    CONF_ENTITIES,
+    CONF_EXCLUDED_ENTITIES,
+    DB_SUBDIR,
+    DEFAULT_DEBOUNCE_S,
+    DISCOVERY_AUTO_TRACK,
+    DOMAIN,
+    SIGNAL_WEAR_UPDATED,
+)
 
 _LOG = logging.getLogger(__name__)
 
@@ -82,6 +91,36 @@ def async_register_services(hass: HomeAssistant) -> None:
         if coordinator.entry is not None:
             await hass.config_entries.async_reload(coordinator.entry.entry_id)
 
+    def _untrack_in_options(coordinator, entity_id: str, *, exclude: bool) -> bool:
+        """Drop entity_id from the entry's tracked list so a reload can't re-track
+        it. When `exclude` (auto_track mode), also add it to CONF_EXCLUDED_ENTITIES
+        — otherwise scan_trackable would re-discover a still-existing entity on the
+        post-purge reload and undo the purge. Returns True when the entry changed
+        (which reloads via its update listener); False means the caller reloads."""
+        entry = coordinator.entry
+        if entry is None:
+            return False
+        entities = list(entry.options.get(CONF_ENTITIES, []))
+        excluded = list(entry.options.get(CONF_EXCLUDED_ENTITIES, []))
+        changed = False
+        if entity_id in entities:
+            entities.remove(entity_id)
+            changed = True
+        if exclude and entity_id not in excluded:
+            excluded.append(entity_id)
+            changed = True
+        if not changed:
+            return False
+        hass.config_entries.async_update_entry(
+            entry,
+            options={
+                **entry.options,
+                CONF_ENTITIES: entities,
+                CONF_EXCLUDED_ENTITIES: excluded,
+            },
+        )
+        return True
+
     async def handle_reset(call: ServiceCall) -> None:
         coordinator = _require_coordinator()
         entity_id = call.data["entity_id"]
@@ -127,7 +166,7 @@ def async_register_services(hass: HomeAssistant) -> None:
         meta_id = await _meta_id(coordinator, entity_id)
         ts = int(time.time())
         await coordinator.writer.run(
-            lambda conn: registry.set_disabled(conn, entity_id, disabled)
+            lambda conn: registry.set_disabled(conn, entity_id, disabled, "user")
         )
         await _audit(coordinator, meta_id, "disable",
                      {"entity_id": entity_id, "disabled": disabled}, ts)
@@ -147,7 +186,17 @@ def async_register_services(hass: HomeAssistant) -> None:
             "unique_id": row.unique_id if row else None,
         }, ts)
         await coordinator.writer.run(lambda conn: storage.purge_entity_sync(conn, meta_id))
-        await _reload(coordinator)
+        # DESIGN §9: purge is irreversible. Remove the entity from the entry's
+        # tracked options so the reload doesn't re-upsert a fresh zeroed row and
+        # resurrect the device; in auto_track also exclude it so scan_trackable
+        # can't re-discover a still-existing entity. Updating options already
+        # reloads via the update listener; only reload explicitly when unchanged.
+        auto_track = (
+            coordinator.entry is not None
+            and coordinator.entry.options.get(CONF_DISCOVERY_MODE) == DISCOVERY_AUTO_TRACK
+        )
+        if not _untrack_in_options(coordinator, entity_id, exclude=auto_track):
+            await _reload(coordinator)
 
     async def handle_purge_all(call: ServiceCall) -> None:
         coordinator = _require_coordinator()
@@ -269,14 +318,22 @@ async def _clear_lts(hass: HomeAssistant, coordinator, entity_id: str) -> None:
         from homeassistant.components.recorder import get_instance
         from homeassistant.helpers import entity_registry as er
 
+        from .sensor import WearPercent, _SENSOR_CLASSES
+
         tracked = coordinator.get_tracked(entity_id)
         if tracked is None:
             return
-        prefix = f"wear_tracker_{tracked.unique_id or tracked.entity_id}_"
+        unique_root = registry.wear_sensor_root(tracked)
+        # Match this entity's own sensor unique_ids exactly. A startswith(prefix)
+        # scan would also match a sibling like switch.pump_2 when resetting
+        # switch.pump (HA's duplicate-naming convention) and wipe its statistics.
+        sensor_keys = {cls.SENSOR_KEY for cls in _SENSOR_CLASSES}
+        sensor_keys |= {WearPercent.SENSOR_KEY, "health_alert"}
+        own_ids = {f"wear_tracker_{unique_root}_{key}" for key in sensor_keys}
         stat_ids = [
             e.entity_id
             for e in er.async_get(hass).entities.values()
-            if e.platform == DOMAIN and (e.unique_id or "").startswith(prefix)
+            if e.platform == DOMAIN and e.unique_id in own_ids
         ]
         if stat_ids:
             get_instance(hass).async_clear_statistics(stat_ids)

@@ -23,7 +23,7 @@ import voluptuous as vol
 
 from homeassistant.config_entries import SOURCE_IMPORT, ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP
-from homeassistant.core import HomeAssistant
+from homeassistant.core import Event, HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.typing import ConfigType
@@ -93,8 +93,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     entity_ids = discovery.resolve_tracked_entities(hass, dict(entry.options))
     try:
-        # Source states may not be loaded yet at boot; the state-change
-        # subscription picks them up, so we don't gate on async_at_started.
+        # Machine seeding is gated on HA-started inside the coordinator so it
+        # observes real source states rather than a spurious DISCONNECTED.
         await coordinator.async_start(entity_ids)
     except Exception as err:
         _LOG.exception("wear_tracker: coordinator failed to start")
@@ -103,12 +103,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         raise ConfigEntryNotReady("coordinator failed to start") from err
     _LOG.info("wear_tracker: tracking %d entities", len(entity_ids))
 
+    async def _async_on_ha_stop(_event: Event) -> None:
+        await coordinator.async_shutdown()
+
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(_async_reload_on_update))
     entry.async_on_unload(
-        hass.bus.async_listen_once(
-            EVENT_HOMEASSISTANT_STOP, lambda _evt: coordinator.async_shutdown()
-        )
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _async_on_ha_stop)
     )
     return True
 

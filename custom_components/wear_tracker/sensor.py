@@ -22,7 +22,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN, SIGNAL_WEAR_UPDATED
 from .coordinator import WearCoordinator
-from .registry import TrackedEntity
+from .registry import TrackedEntity, wear_sensor_root
 
 _LOG = logging.getLogger(__name__)
 
@@ -45,8 +45,7 @@ class _WearBaseSensor(SensorEntity):
         self._tracked = tracked
         self._meta_id = tracked.id
         self._summary: dict[str, Any] | None = None
-        unique_root = tracked.unique_id or tracked.entity_id
-        self._attr_unique_id = f"wear_tracker_{unique_root}_{self.SENSOR_KEY}"
+        self._attr_unique_id = f"wear_tracker_{wear_sensor_root(tracked)}_{self.SENSOR_KEY}"
         device_info = DeviceInfo(
             identifiers={(DOMAIN, str(tracked.id))},
             name=tracked.friendly_name or tracked.entity_id,
@@ -162,10 +161,21 @@ class WearPercent(_WearBaseSensor):
 
     @property
     def native_value(self) -> float | None:
-        if self._summary is None or not self._tracked.rated_hours:
+        if self._summary is None:
             return None
-        hours = self._summary["lifetime_seconds"] / 3600
-        return round(hours / self._tracked.rated_hours * 100, 1)
+        # Report the worst wear against whichever rating(s) exist (DESIGN §6/§10):
+        # a cycles-rated relay and an hours-rated bulb both get a wear_pct.
+        ratios: list[float] = []
+        if self._tracked.rated_hours:
+            hours = self._summary["lifetime_seconds"] / 3600
+            ratios.append(hours / self._tracked.rated_hours * 100)
+        if self._tracked.rated_cycles:
+            ratios.append(
+                self._summary["lifetime_cycles"] / self._tracked.rated_cycles * 100
+            )
+        if not ratios:
+            return None
+        return round(max(ratios), 1)
 
 
 class _RateSensor(_WearBaseSensor):
@@ -232,6 +242,6 @@ async def async_setup_entry(
             continue
         via_device = coordinator.get_source_device(eid)
         entities.extend(cls(coordinator, tracked, via_device) for cls in _SENSOR_CLASSES)
-        if tracked.rated_hours:
+        if tracked.rated_hours or tracked.rated_cycles:
             entities.append(WearPercent(coordinator, tracked, via_device))
     async_add_entities(entities)

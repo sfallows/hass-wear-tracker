@@ -15,7 +15,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN, SIGNAL_WEAR_UPDATED
 from .coordinator import WearCoordinator
-from .registry import TrackedEntity
+from .registry import TrackedEntity, wear_sensor_root
 
 
 class HealthAlertBinarySensor(BinarySensorEntity):
@@ -33,8 +33,7 @@ class HealthAlertBinarySensor(BinarySensorEntity):
     ) -> None:
         self._coordinator = coordinator
         self._meta_id = tracked.id
-        unique_root = tracked.unique_id or tracked.entity_id
-        self._attr_unique_id = f"wear_tracker_{unique_root}_health_alert"
+        self._attr_unique_id = f"wear_tracker_{wear_sensor_root(tracked)}_health_alert"
         device_info = DeviceInfo(
             identifiers={(DOMAIN, str(tracked.id))},
             name=tracked.friendly_name or tracked.entity_id,
