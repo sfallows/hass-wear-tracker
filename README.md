@@ -2,7 +2,7 @@
 
 A Home Assistant custom integration that tracks **lifetime usage** for any entity — so you can finally answer "is this bulb still good?" or "did this relay hit its rated cycles?"
 
-> **Status:** early design, no code yet. See [`DESIGN.md`](./DESIGN.md) for the full spec.
+> **Status:** v0.1-v0.4 implemented — core tracking, config-flow UI + discovery, anomaly detection, and admin services. Not yet listed in the HACS default repository. See [`DESIGN.md`](./DESIGN.md) for the full spec.
 
 ## Why this exists
 
@@ -15,6 +15,7 @@ This integration:
 - Counts **`lifetime_cycles`** (off→on transitions) and **`connection_drops`** (available→unavailable transitions).
 - Exposes **`wear_pct`** comparing accumulated hours to a rated lifetime from a built-in catalog of common devices (or your own override).
 - Detects **flap-rate anomalies** — if an entity's hourly transition rate is 5× its 30-day baseline, fires `wear_tracker.flap_anomaly` so you can route an alert to Telegram, Pushover, or push notifications.
+- Fires **`wear_tracker.wear_critical`** at 90/95/100 % of rated hours **or** cycles, and **`wear_tracker.connection_anomaly`** when an entity's unavailable rate spikes above its baseline — both routable to notifications.
 - Provides **full audit export** — service `wear_tracker.export_log(entity_id, start, end)` writes a CSV of every raw state transition.
 
 ## Supported entity types
@@ -74,7 +75,7 @@ Then pick a discovery mode for future new devices:
 | `sensor.<name>_lifetime_cycles` | Cumulative on-cycles (off→on, and recovered-from-unavailable→on; sub-2 s bounces excluded by default) |
 | `sensor.<name>_connection_drops` | Total available→unavailable transitions |
 | `sensor.<name>_duty_cycle_pct` | `lifetime_hours / connected_hours × 100` |
-| `sensor.<name>_wear_pct` | `lifetime_hours / rated_hours × 100` (if rated set) |
+| `sensor.<name>_wear_pct` | Worst of `lifetime_hours / rated_hours` and `lifetime_cycles / rated_cycles`, ×100 (if a rating is set) |
 | `sensor.<name>_flap_rate_1h` | Transitions in the last hour |
 | `sensor.<name>_flap_rate_24h` | Transitions per hour, averaged over the last 24 h |
 | `sensor.<name>_unavail_rate_1h` | Connection drops in the last hour |

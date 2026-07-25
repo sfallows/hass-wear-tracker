@@ -12,7 +12,7 @@ It also computes short-window flap rates and compares them against a 30-day roll
 flowchart TD
     HA[HA event bus] -->|state_changed| Coord[WearCoordinator]
     Coord --> SM[StateMachine<br/>3-state per entity]
-    SM -->|transition row| Writer[AsyncSqliteWriter<br/>batched, WAL]
+    SM -->|transition row| Writer[AsyncSqliteWriter<br/>serialized, WAL]
     Writer --> DB[(wear_tracker.db<br/>SQLite)]
     SM -->|on transition| Roll[Rollup engine<br/>summary + flap_rate]
     Coord -->|60s tick| Roll
@@ -26,9 +26,9 @@ flowchart TD
     Catalog[catalog.py] --> Registry
 ```
 
-A single `WearCoordinator` owner class per config entry — a plain class, **not** `DataUpdateCoordinator`, since this integration is event-driven, not poll-driven. It owns: (a) the per-entity state machines in memory, (b) a single async SQLite writer task, (c) the rollup engine that ticks every 60 s and on every transition, and (d) the sensor platform refresh signal.
+A single `WearCoordinator` owner class per config entry — a plain class, **not** `DataUpdateCoordinator`, since this integration is event-driven, not poll-driven. It owns: (a) the per-entity state machines in memory, (b) a single-worker SQLite writer thread (`AsyncSqliteWriter`, all writes serialized off the event loop), (c) the rollup/anomaly engine, which runs every 60 s on the heartbeat and once at startup (each transition separately refreshes the affected sensors), and (d) the sensor platform refresh signal.
 
-State events arrive via `async_track_state_change_event` on the set of tracked entity IDs. Sensors refresh by subscribing to `async_dispatcher_connect(hass, SIGNAL_WEAR_UPDATED, ...)`; the coordinator calls `async_dispatcher_send(hass, SIGNAL_WEAR_UPDATED, entity_id)` after each summary write. The 60 s rollup tick uses `async_track_time_interval`.
+State events arrive via `async_track_state_change_event` on the set of tracked entity IDs. Sensors refresh by subscribing to `async_dispatcher_connect(hass, SIGNAL_WEAR_UPDATED, ...)`; the coordinator calls `async_dispatcher_send(hass, SIGNAL_WEAR_UPDATED, meta_id)` after each summary write — the signal carries the surrogate `entity_meta.id`, which survives entity_id renames. The 60 s heartbeat (`async_track_time_interval`) folds in-progress on-time into `summary`, stamps `meta.last_alive`, and drives the rollup.
 
 ## 3. Code structure
 
@@ -104,27 +104,28 @@ Each observed transition writes one row to `transitions` with `(ts, entity_meta_
 
 ### Edge cases
 
-- **HA restart while ON.** On startup, for each tracked entity, read last row from `transitions`. If `to_state == ON` and `last_seen_alive_ts` (heartbeat written every 60 s) is within 2 min of now (2× heartbeat = one missed beat tolerated), attribute the gap as ON. If gap > 2 min, attribute as `DISCONNECTED` and log a synthetic transition at `last_seen_alive_ts`. Sizing: tighter than the prior 5 min window so an unclean shutdown can't credit more than ~2 min of fictional on-time. Heartbeat is a single `meta.last_alive` row updated by the coordinator.
+- **HA restart while ON.** Seeding is deferred to HA-started (source integrations load *after* us, so seeding at entry setup would observe a spurious `DISCONNECTED` and fabricate a cycle when the real `ON` arrives, and rob this recovery of its credit). At seed time, for each tracked entity whose `summary.last_state` was `ON` and which reads `ON` now, credit the downtime as ON — but only if the offline gap measured at *entry setup* (`_setup_ts − last_alive`) is within `RESTART_GAP_TOLERANCE_S` (2× heartbeat = one missed beat tolerated). Measuring the gap at seed-now would blow the tolerance on slow hosts where boot-to-started is 100-150 s and silently drop the credit that matters most. The credited amount runs `last_alive → seed-now` (or, when a live event bootstrapped the machine mid-seed, `last_alive → that bootstrap ts`, so the credit never overlaps live accrual), hard-capped at `RESTART_CREDIT_MAX_S` (5 min) so a slow boot or seed-retry backoff can't fabricate on-time if the device was toggled while unobserved. Longer gaps are left uncredited — the seed just re-observes the current real state rather than inventing on-time across an unknown downtime. Heartbeat is a single `meta.last_alive` row the coordinator rewrites every 60 s (and once at seed end, so a second restart inside the tolerance window recomputes the gap from this boot rather than re-crediting the same downtime).
 - **NTP / wall-clock corrections.** Always compute deltas with `time.monotonic()` for the period being closed, but stamp `ts` with `dt_util.utcnow()` for the audit log. Reject negative deltas (clamp to 0) and log a warning.
-- **entity_id rename.** `entity_meta` uses a surrogate `id` (INTEGER PK); all history tables (`transitions`, `daily_summary`, `summary`) FK to it. `unique_id` (from HA's entity_registry) is the durable natural key when present; `entity_id` is treated as a mutable label column. On `event_entity_registry_updated` with `action="update"` and `changes` containing `entity_id`, update only `entity_meta.entity_id` — history rows reference `entity_meta.id` and need no rewrite. When an entity is first tracked without a `unique_id` (legacy YAML entities), persist what we have and reconcile on the first registry event that exposes one. **Swap renames** (rare but real: user batch-renames `light.a → light.b` and `light.b → light.a` in one config flow) collide with the `UNIQUE(entity_id)` constraint mid-update — the handler must run inside one transaction, renaming the first row to a sentinel (`__pending__<id>`), then the second row to its target, then the sentinel row to its final value.
+- **entity_id rename.** `entity_meta` uses a surrogate `id` (INTEGER PK); all history tables (`transitions`, `daily_summary`, `summary`) FK to it. Identity is the composite **(platform, domain, unique_id)** — the tuple HA actually keeps unique — enforced by a `UNIQUE` index (migration 05); `unique_id` alone is *not* unique across platforms, so keying on it would merge two unrelated devices. `entity_id` is a mutable label column. On `event_entity_registry_updated` with `action="update"` where the `entity_id` changed, `reconcile_rename` moves only the `entity_id` label onto the row that owns that identity — history rows reference `entity_meta.id` and need no rewrite. Legacy rows written before platform tracking have `platform = NULL`; both `upsert` and `reconcile_rename` fall back to a relaxed `(NULL, domain, unique_id)` match, but that fallback is **guarded** — it is refused when the stale `entity_id` still belongs to a live entity, so a `unique_id` string shared across platforms can't let one device seize another's history. **Swap renames** (user batch-renames `light.a → light.b` and `light.b → light.a`, delivered as two independent registry events) collide with the `UNIQUE(entity_id)` constraint mid-update — `reconcile_rename` runs in one transaction, parking the occupant row under a sentinel `entity_id` (`__wt_pending_<id>__`) first so the second event finds its target free and the parked row settles onto it.
 - **unavailable → on with no off in between.** Treated as legitimate: open new on-period, increment `lifetime_cycles` by 1 (the device cycled while we couldn't see it; we count the visible re-ignition).
 - **Rapid bounces under 2 s.** Recorded as raw transitions but excluded from `lifetime_cycles` count (debounce window, configurable per entity). The transition row is still written for audit and flap-rate.
 - **Initial bootstrap.** When an entity is first tracked, its first observed state seeds the machine without writing a cycle or drop.
-- **Entity deletion.** On `event_entity_registry_updated` with `action="remove"`, the integration sets `entity_meta.disabled = 1` (soft delete) rather than dropping the row — lifetime totals are preserved for audit and for re-registration of the same `unique_id` (e.g., a Zigbee device re-paired with the same IEEE address). Sensor entities are unloaded on the next coordinator reload. A `wear_tracker.purge` service (v0.4+) hard-deletes the row and cascades history when the user really wants the data gone.
-- **Integration uninstall.** `async_remove_entry` does *not* delete `<config>/wear_tracker/`. Reinstalling picks up where it left off (rows match by `unique_id`). Users wanting a clean slate run `wear_tracker.purge_all` (v0.4+) or delete the directory manually.
+- **Entity deletion.** On `event_entity_registry_updated` with `action="remove"`, the coordinator first closes the final on/connected period and records the `DISCONNECTED` drop (so `last_state` lands `DISCONNECTED` and the last ON period isn't lost), then sets `disabled = 1` with `disabled_reason = 'removed'` (soft delete) rather than dropping the row — lifetime totals are preserved for audit and for re-registration (e.g., a Zigbee device re-paired with the same IEEE address). Re-registration resumes the paused row **only on a confirmed identity match** ((platform, domain, unique_id)) — never on a bare `entity_id` match, which could belong to a different device that inherited the freed `entity_id`. If a *different* identity claims the freed `entity_id` while the removed row still holds it, that row is retired to a tombstone label (`__wt_retired_<id>__…`; history preserved, still disabled) and the claimant gets a fresh row. `disabled_reason='removed'` auto-resumes on re-pair; a deliberate `wear_tracker.disable` sets `disabled_reason='user'`, which stays sticky across restarts. A live re-pair (or re-create of a previously removed `entity_id`) schedules a config-entry reload so tracking resumes without a full HA restart, in every discovery mode — including the case where a restart between removal and re-pair left the disabled placeholder tracked. Sensor entities are (re)created on that reload. A `wear_tracker.purge` service (v0.4+) hard-deletes the row and cascades history when the user really wants the data gone.
+- **Integration uninstall.** Config-entry removal does *not* delete `<config>/wear_tracker/`. Reinstalling picks up where it left off (rows match by identity). Users wanting a clean slate run `wear_tracker.purge_all` (v0.4+) or delete the directory manually.
 
 ## 5. Storage schema
 
 SQLite at `<config>/wear_tracker/wear_tracker.db`. Pragmas: `journal_mode=WAL`, `synchronous=NORMAL`, `foreign_keys=ON`.
 
-The schema below is the v1.0 end-state. Tables are introduced phase-by-phase via migrations (see **Schema migrations** below): v0.1 creates `entity_meta` / `transitions` / `daily_summary` / `summary` / `meta`; v0.3 adds `events_fired` / `flap_baseline`; v0.4 adds `audit_log`. Each table's indexes ship with the table.
+The schema below is the v1.0 end-state. Tables are introduced phase-by-phase via migrations (see **Schema migrations** below): v0.1 creates `entity_meta` / `transitions` / `daily_summary` / `summary` / `meta`; v0.3 adds `events_fired` / `flap_baseline`; v0.4 adds `audit_log`. Post-v0.4 correctness fixes add `summary.reset_ts` (migration 04) and `entity_meta.platform` + `disabled_reason` (migration 05, an identity-key table rebuild). Each table's indexes ship with the table.
 
 ```sql
 CREATE TABLE entity_meta (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    unique_id       TEXT UNIQUE,             -- HA entity_registry unique_id when available
+    id              INTEGER PRIMARY KEY,
+    unique_id       TEXT,                    -- HA entity_registry unique_id when available (unique only per platform+domain)
     entity_id       TEXT NOT NULL UNIQUE,    -- current entity_id; mutable across renames
     domain          TEXT NOT NULL,
+    platform        TEXT,                    -- HA entity_registry platform; part of the identity key
     friendly_name   TEXT,
     manufacturer    TEXT,
     model           TEXT,
@@ -132,10 +133,13 @@ CREATE TABLE entity_meta (
     rated_cycles    INTEGER,
     tracking_since  INTEGER NOT NULL,        -- unix seconds
     disabled        INTEGER NOT NULL DEFAULT 0,
+    disabled_reason TEXT,                    -- 'removed' (auto-resumes on re-pair) | 'user' (sticky) | NULL
     debounce_s      REAL NOT NULL DEFAULT 2.0
 );
 CREATE INDEX ix_entity_meta_active ON entity_meta(id) WHERE disabled = 0;
--- entity_id is already UNIQUE (implicit index); no separate index needed.
+-- Identity is the composite HA keeps unique. NULLs compare distinct in a UNIQUE
+-- index, so legacy rows without a unique_id/platform coexist and match by entity_id.
+CREATE UNIQUE INDEX ix_entity_meta_identity ON entity_meta(platform, domain, unique_id);
 
 CREATE TABLE transitions (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -171,6 +175,7 @@ CREATE TABLE summary (
     last_state       TEXT,
     last_change_ts   INTEGER,
     updated_ts       INTEGER NOT NULL,
+    reset_ts         INTEGER,                -- unix seconds of the last wear_tracker.reset; NULL = never. recompute/fold ignore pre-reset history
     FOREIGN KEY (entity_meta_id) REFERENCES entity_meta(id) ON DELETE CASCADE
 );
 
@@ -197,7 +202,7 @@ CREATE TABLE flap_baseline (
 CREATE TABLE audit_log (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     entity_meta_id  INTEGER,                 -- nullable so rows survive purge
-    action          TEXT NOT NULL,           -- 'reset' | 'set_rated' | 'disable' | 'recompute' | 'purge'
+    action          TEXT NOT NULL,           -- 'reset' | 'set_rated' | 'disable' | 'recompute' | 'purge' | 'purge_all'
     ts              INTEGER NOT NULL,
     payload         TEXT,                    -- JSON: prior/new values, actor, plus entity_id/unique_id snapshot (so purge audits stay readable after FK is SET NULL)
     FOREIGN KEY (entity_meta_id) REFERENCES entity_meta(id) ON DELETE SET NULL
@@ -209,19 +214,19 @@ CREATE TABLE meta (
 );  -- last_alive, schema_version
 ```
 
-**Write discipline.** Single `AsyncSqliteWriter` task with an `asyncio.Queue`. Transitions and summary updates for the same event are committed in one transaction. Batch interval: flush every 1 s or 50 rows, whichever first. On HA shutdown, `async_on_stop` drains the queue with a 5 s timeout. Every commit is atomic via WAL.
+**Write discipline.** `AsyncSqliteWriter` owns the SQLite connection on a single-worker thread; every read/write is a callable submitted to that thread, so all writes serialize off the event loop. A transition and its `summary` update commit together in one transaction (`write_transition_sync`). In-progress on/connected time is *not* written per event — it's folded into `summary` on the 60 s heartbeat (`apply_accruals`) and once more on shutdown; an accrual write that fails is re-queued onto the next tick rather than dropped. Shutdown is a real `EVENT_HOMEASSISTANT_STOP` async listener (`async_shutdown`) that unsubscribes every timer/subscription, awaits in-flight persist tasks, flushes pending accruals, writes a final heartbeat, and closes the connection — race-safe against a seed still running. Every commit is atomic via WAL.
 
-**Schema migrations.** `meta.schema_version` holds the current integer version (starts at `1`). Migration scripts live at `custom_components/wear_tracker/migrations/NN_description.sql` (zero-padded ordering). On startup, `AsyncSqliteWriter._apply_migrations()` reads `schema_version`, applies any newer files in order (each inside its own transaction), and bumps `schema_version`. v0.1 ships at version 1 (the schema in this section); later phases add columns/tables additively where possible. Downgrades are not supported — users wanting to roll back run `purge_all` and reinstall an older release.
+**Schema migrations.** `meta.schema_version` holds the current integer version (a missing `meta` table reads as `0`). Migration scripts live at `custom_components/wear_tracker/migrations/NN_description.sql` (zero-padded ordering). On open, `AsyncSqliteWriter._apply_migrations_sync()` reads `schema_version` and applies each newer file **plus its `schema_version` stamp in one wrapping transaction**, so a crash between applying a migration and bumping the version can't leave a half-applied version that re-runs (and fails) on the next boot. Foreign-key enforcement is toggled off around the run so a table-rebuild migration can `DROP` the old parent without cascade-deleting history (surrogate ids are preserved so the restored FK constraints stay satisfied). Any failure rolls the open transaction back and closes the connection — releasing the write lock so HA's `ConfigEntryNotReady` retry surfaces the real error instead of `database is locked`. SQLite can't add a column or relax a constraint idempotently, so migrations 04 (`summary.reset_ts`) and 05 (identity rebuild) are **idempotent table rebuilds** rather than bare `ALTER`s. Downgrades are not supported — users wanting to roll back run `purge_all` and reinstall an older release.
 
-**Retention.** `transitions` rows older than 90 days purged hourly after being folded into `daily_summary`. `daily_summary` and `summary` retained forever. `recompute(entity_id)` rebuilds `summary` by summing `daily_summary` + replaying remaining `transitions`.
+**Retention.** `transitions` rows older than 90 days are folded into `daily_summary` then purged, hourly (`fold_and_purge_sync`). The fold is reset-aware: rows dated *on the reset day but before `summary.reset_ts`* are excluded from the fold (they are still purged) so a folded pre-reset row can't resurrect counters a reset zeroed; prior whole days still fold, as the permanent archive `keep_history` protects. `daily_summary` and `summary` are retained forever. `recompute(entity_id)` rebuilds `summary` by summing `daily_summary` (days ≥ the reset day) plus replaying remaining `transitions` with `ts ≥ reset_ts`.
 
-**Time semantics.** Durations come from `time.monotonic()`; wall-clock `ts` comes from `dt_util.utcnow()`. Each transition row's `delta_s` records the duration of the *immediately preceding observable state period*: `(none) → first state` writes `0`; `OFF → ON` writes the off-period duration; `ON → OFF` writes the on-period duration; `OFF → DISCONNECTED` and `ON → DISCONNECTED` write the off/on-period duration that just ended; `DISCONNECTED → OFF` and `DISCONNECTED → ON` write the disconnected-period duration. Same-state transitions (`D→D`, `OFF→OFF`, `ON→ON`) write no row at all — these are the `(noop)` cells in the §4 transition table, reflecting duplicate state events from HA's bus. Connected-period totals (`summary.connected_seconds`, `daily_summary.connected_seconds`) are *not* derived from `delta_s` — the writer maintains an in-memory running connected-interval per entity and commits the increment on each `(*) → DISCONNECTED` transition. Negative deltas are clamped to 0 with a warning. `daily_summary.day` is UTC; the display layer renders local at the sensor level.
+**Time semantics.** Durations come from `time.monotonic()`; wall-clock `ts` comes from `dt_util.utcnow()`. Each transition row's `delta_s` records the duration of the *immediately preceding observable state period*: `(none) → first state` writes `0`; `OFF → ON` writes the off-period duration; `ON → OFF` writes the on-period duration; `OFF → DISCONNECTED` and `ON → DISCONNECTED` write the off/on-period duration that just ended; `DISCONNECTED → OFF` and `DISCONNECTED → ON` write the disconnected-period duration. Same-state transitions (`D→D`, `OFF→OFF`, `ON→ON`) write no row at all — these are the `(noop)` cells in the §4 transition table, reflecting duplicate state events from HA's bus. Connected-period totals (`summary.connected_seconds`) are *not* derived from `delta_s` — the state machine tracks a per-entity connected-interval anchor and credits the elapsed connected time on **every** transition (and on every flush), not only on disconnect. Crediting connected time in lockstep with on-time is what keeps `duty_cycle_pct = lifetime / connected` from ever exceeding 100 %. Negative monotonic deltas are clamped to 0. `daily_summary.day` is UTC; the display layer renders local at the sensor level.
 
 **Recompute monotonicity.** `recompute` is allowed to *raise* a counter to match observed history but never to lower a value already emitted as sensor state — a `total_increasing` LTS series would otherwise show a phantom drop. If the recomputed total is lower (e.g. transient corruption inflated the prior summary), the prior value stays as a floor and a warning is logged.
 
 **Backups.** The DB lives under `<config>/`, so HA's built-in backup integration captures `wear_tracker.db` automatically. WAL mode is per-transaction atomic, so a backup snapshot is internally consistent regardless of in-flight writes — SQLite truncates incomplete WAL frames on next open. No pre-backup hook is required. (HA's backup manager uses a callback subscription API, not a bus event; if a future version of this integration wants to checkpoint before backup, it should subscribe via `BackupManager.async_subscribe_events`, not listen on the event bus.)
 
-**Uninstall.** `async_remove_entry` does *not* delete `<config>/wear_tracker/`. Reinstalling picks up where it left off (rows match by `unique_id`). For a clean slate, run `wear_tracker.purge_all` (v0.4+) or remove the directory manually.
+**Uninstall.** Config-entry removal does *not* delete `<config>/wear_tracker/`. Reinstalling picks up where it left off (rows match by identity). For a clean slate, run `wear_tracker.purge_all` (v0.4+) or remove the directory manually.
 
 ## 6. Sensor entity classes
 
@@ -234,14 +239,16 @@ Each sensor entity is registered with HA's long-term statistics (LTS) and histor
 | `lifetime_cycles` | — | `total_increasing` | `cycles` | Integer; LTS-eligible. |
 | `connection_drops` | — | `total_increasing` | `drops` | Integer; LTS-eligible. |
 | `duty_cycle_pct` | — | `measurement` | `%` | Bounded [0, 100]. |
-| `wear_pct` | — | `measurement` | `%` | May exceed 100 once rated lifetime is reached. |
+| `wear_pct` | — | `measurement` | `%` | Present when `rated_hours` **or** `rated_cycles` is set; reports the max (worst) of the two ratios. May exceed 100 once rated lifetime is reached. |
 | `flap_rate_1h` | — | `measurement` | `1/h` | Updated every rollup tick. |
 | `flap_rate_24h` | — | `measurement` | `1/h` | |
 | `unavail_rate_1h` | — | `measurement` | `1/h` | |
 
-`total_increasing` sensors have exactly one legitimate decrease path: the `wear_tracker.reset` service, which also clears the corresponding LTS series via `homeassistant.components.recorder.statistics.clear_statistics` (an undocumented HA internal — call defensively, catch `ImportError`/`AttributeError` and fall back to leaving the series alone with a warning; pin a minimum HA version in `manifest.json` and revisit on each major HA release). `recompute` enforces the never-decrease floor described in §5.
+`total_increasing` sensors have exactly one legitimate decrease path: the `wear_tracker.reset` service, which also clears the corresponding LTS series via `recorder.get_instance(hass).async_clear_statistics` (an internal API — the whole call is wrapped defensively so a missing/renamed recorder API just logs at DEBUG and leaves the series alone). It matches this entity's **own** sensor unique_ids exactly (not a name prefix), so resetting `switch.pump` can't wipe the statistics of a sibling like `switch.pump_2`. `recompute` enforces the never-decrease floor described in §5.
 
 All wear sensors set `entity_category = DIAGNOSTIC` so they default off the main dashboard, and use `device_info(via_device=...)` to attach to the source entity's device.
+
+Each sensor's unique_id is `wear_tracker_<root>_<key>`, where `root` (`registry.wear_sensor_root`) is `platform_domain_uniqueid` when the platform is known, the bare `unique_id` when the row has one but platform is still `NULL`, else the `entity_id`. Because the composite-identity work (see §4) changed this root, `async_setup_entry` runs an entity-registry migration on every boot that remaps both old root forms in place — so upgrades keep their existing sensor `entity_id`s and LTS series instead of re-registering everything as `*_2`.
 
 ## 7. Catalog format
 
@@ -297,38 +304,39 @@ wear_tracker:
 ### New-device prompts (v0.2+)
 
 - Coordinator listens to `event_entity_registry_updated` (action=`create`).
-- If entity domain is trackable and `auto_discovery_mode == "prompt"`, create a Repair Issue via `ir.async_create_issue` with `severity=warning`, `is_fixable=True`, `translation_key="new_device"`, and `data={"entity_id": ..., "domain": ...}`.
-- The Repair fix flow (`repairs.py:WearTrackerFixFlow`) presents three buttons: **Track**, **Skip**, **Never ask for this domain**.
+- The create handler first skips the integration's **own** entities (`platform == wear_tracker`, e.g. the health-alert binary sensors — tracking them would loop discovery), already-excluded entities/domains, and non-trackable domains. A `create` for a previously-removed `entity_id` still present in the tracked options instead schedules a reload, resuming via the §4 identity path.
+- If entity domain is trackable and `discovery_mode == "prompt"`, create a Repair Issue via `ir.async_create_issue` with `severity=warning`, `is_fixable=True`, `translation_key="new_device"`, and `data={"entity_id": ..., "domain": ...}`.
+- The Repair fix flow (`repairs.py:NewDeviceRepairFlow`) presents three menu options: **Track**, **Skip**, **Never ask for this domain**.
 - "Never" updates option `excluded_domains` on the config entry.
-- `auto_track` mode skips the issue and writes the row directly.
+- `auto_track` mode skips the issue and adds the entity to the tracked options directly.
 
 ### Options flow
 
-Lets user toggle `auto_discovery_mode`, edit per-entity `rated_hours` / `debounce_s` / `disabled`, and import/export `entity_meta` as YAML.
+Currently exposes two settings: the discovery mode (`prompt` / `auto_track` / `off`) and the `include_binary_sensors` toggle. Per-entity `rated_hours` / `rated_cycles` and `disabled` are changed through the `set_rated` / `disable` services (§9), not the options flow.
 
 ## 9. Service catalog (`services.yaml`)
 
 | Service | Arguments | Behavior | Returns |
 |---|---|---|---|
-| `wear_tracker.reset` | `entity_id: str`, `keep_history: bool = false` | Zeroes `summary` for entity and clears LTS series via `recorder.statistics.clear_statistics`. If `keep_history=false`, also deletes its `transitions` and `daily_summary`. Records prior counter values to `audit_log`. | none |
-| `wear_tracker.set_rated` | `entity_id: str`, `hours: float?`, `cycles: int?` | Updates `entity_meta.rated_hours` / `rated_cycles`. Triggers sensor refresh. | none |
-| `wear_tracker.export_log` | `entity_id: str`, `start: datetime`, `end: datetime`, `filename: str?` | Writes CSV (`ts,from,to,raw_from,raw_to,delta_s`) to `<config>/wear_tracker/exports/<filename>` (default: `<entity>_<start>.csv`). `filename` is rejected if it contains path separators, `..`, or is absolute; must end in `.csv`. Output is always under the exports directory. | `{path: str, rows: int}` via response data. |
-| `wear_tracker.recompute` | `entity_id: str?` (default: all) | Rebuilds `summary` from `daily_summary` + remaining `transitions`. | `{recomputed: [entity_id, ...]}` |
-| `wear_tracker.disable` | `entity_id: str`, `disabled: bool = true` | Sets `entity_meta.disabled`. Stops accruing but keeps history. | none |
-| `wear_tracker.purge` | `entity_id: str` | Hard-deletes the `entity_meta` row; cascades `transitions`, `daily_summary`, `summary`, `events_fired`. Audit row written *before* delete with `entity_id` and `unique_id` captured in `payload`. Irreversible. | none |
-| `wear_tracker.purge_all` | `confirm: bool` (must be `true`) | Hard-deletes every entity_meta row and its cascades. Skipped entirely unless `confirm=true`; this guards against accidental invocation from automations. | `{purged: int}` |
+| `wear_tracker.reset` | `entity_id: str`, `keep_history: bool = false` | Zeroes `summary` for entity (recording `reset_ts` so `recompute`/fold won't resurrect pre-reset counters) and clears its LTS series. If `keep_history=false`, also deletes its `transitions` and `daily_summary`. Clears only the `wear_critical` debounce rows (re-arming wear alerts for a replaced device) while leaving flap/connection anomaly debounce intact. Records prior counter values to `audit_log`, then reloads the entry. | none |
+| `wear_tracker.set_rated` | `entity_id: str`, `hours: float?`, `cycles: int?` | Updates `entity_meta.rated_hours` / `rated_cycles` (at least one required). Reloads the entry so sensors/`wear_pct` pick up the new rating. | none |
+| `wear_tracker.export_log` | `entity_id: str`, `start: datetime`, `end: datetime`, `filename: str?` | Writes CSV (`ts,from,to,raw_from,raw_to,delta_s`) to `<config>/wear_tracker/exports/<filename>` (default: `<entity>_<start>.csv`). `filename` is rejected if it contains path separators, `..`, a leading `.`, or doesn't end in `.csv`; the resolved path must stay under the exports directory. | `{path: str, rows: int}` via response data. |
+| `wear_tracker.recompute` | `entity_id: str?` (default: all) | Rebuilds `summary` from `daily_summary` + remaining `transitions` (at/after `reset_ts`, never lowering a counter). Dispatches a sensor refresh; no reload. | `{recomputed: [entity_id, ...]}` |
+| `wear_tracker.disable` | `entity_id: str`, `disabled: bool = true` | Sets `entity_meta.disabled` with `disabled_reason='user'` (sticky across restarts, unlike a registry-removal disable). Stops accruing but keeps history. Reloads the entry. | none |
+| `wear_tracker.purge` | `entity_id: str` | Hard-deletes the `entity_meta` row; cascades `transitions`, `daily_summary`, `summary`, `events_fired`, `flap_baseline`. Also drops the entity from the entry's tracked options (and, in `auto_track`, adds it to `excluded_entities`) so the reload can't re-create a zeroed row. Audit row written *before* delete with `entity_id`/`unique_id` in `payload`. Awaits one reload (the options-update listener's duplicate reload is suppressed). Irreversible. | none |
+| `wear_tracker.purge_all` | `confirm: bool` (must be `true`) | Hard-deletes every `entity_meta` row and its cascades (keeps `audit_log`). Clears the tracked options (and in `auto_track` excludes every tracked entity) so the awaited reload can't re-upsert zeroed rows or re-discover still-present entities. Skipped entirely unless `confirm=true`; this guards against accidental invocation from automations. | `{purged: int}` |
 
-All services use `async_register_admin_service` (admin-only) and standard voluptuous schemas. Every admin-action service (everything except `export_log`) writes a row to `audit_log` with prior/new values in `payload` (JSON), so the `audit_log.action` enum (`reset`, `set_rated`, `disable`, `recompute`, `purge`) is exhaustive.
+All services use `async_register_admin_service` (admin-only) and standard voluptuous schemas. Every admin-action service (everything except `export_log`) writes a row to `audit_log` with prior/new values in `payload` (JSON), so the `audit_log.action` enum (`reset`, `set_rated`, `disable`, `recompute`, `purge`, `purge_all`) is exhaustive.
 
 ## 10. Event spec
 
 | Event | Payload | Fired when |
 |---|---|---|
-| `wear_tracker.wear_critical` | `{entity_id, metric: "hours"\|"cycles", pct: 90\|95\|100, value, rated}` | First crossing of each threshold; debounced by the `events_fired` table (one row per `(entity, kind, discriminator)`). |
+| `wear_tracker.wear_critical` | `{entity_id, metric: "hours"\|"cycles", pct: 90\|95\|100, value, rated}` | First crossing of each threshold. `rated_hours` and `rated_cycles` are evaluated independently; each metric+threshold pair (`hours:90`, `cycles:100`, …) debounces separately via its own `events_fired` row, effectively once (debounce ≈ ∞). |
 | `wear_tracker.flap_anomaly` | `{entity_id, flap_rate_1h, baseline_30d, ratio}` | `flap_rate_1h > 5 * baseline_30d` and `flap_rate_1h >= 6` transitions/hour. Min 1 h between repeats per entity. |
-| `wear_tracker.connection_anomaly` | `{entity_id, unavail_rate_1h, baseline_30d, ratio}` | `unavail_rate_1h` exceeds 5× baseline; min 1 h between repeats. |
+| `wear_tracker.connection_anomaly` | `{entity_id, unavail_rate_1h, baseline_30d, ratio}` | `unavail_rate_1h > 5 * baseline_30d` and `>= 3` drops/hour. Min 1 h between repeats. |
 
-Baseline = mean of the same hour-of-day across the last 30 days of `transitions` filtered to flap/unavail events, with a floor of 0.2 to avoid div-by-zero amplification on quiet devices. Per-entity, 24 hour-of-day means live in the `flap_baseline` table — v0.3 populates lazily on first read and refreshes per entity at most once per hour; v0.4's daily cron does a full recompute for every entity nightly. The 60 s rollup tick reads from the cache, never scans `transitions` directly.
+Baseline = mean of the same hour-of-day across the last 30 days of `transitions` (flap = all transitions; unavail = `→ DISCONNECTED` only), with a floor of 0.2 to avoid div-by-zero amplification on quiet devices. Per-entity, per-hour-of-day means live in the `flap_baseline` table, populated lazily and refreshed for the current hour when the cached row is older than one hour (`BASELINE_REFRESH_S`); there is no separate nightly recompute. The rollup tick reads (and lazily refreshes) that cache rather than re-scanning `transitions` on every tick.
 
 ## 11. Phase-by-phase delivery
 
@@ -362,7 +370,7 @@ Manual: induce flapping via a `script` that toggles a fake switch 20× in 5 min;
 
 ### v0.4 — Services + daily rollup
 
-Add: `migrations/03_audit_log.sql` (creates `audit_log` + index), `services.py` (all admin services including `purge` and `purge_all`), `services.yaml`, hourly cron via `async_track_time_interval` for `transitions → daily_summary` fold + 90 d purge + nightly `flap_baseline` recompute, `wear_critical` event at 90/95/100%.
+Add: `migrations/03_audit_log.sql` (creates `audit_log` + index), `services.py` (all admin services including `purge` and `purge_all`), `services.yaml`, hourly cron via `async_track_time_interval` for the `transitions → daily_summary` fold + 90 d purge, `wear_critical` event at 90/95/100%. (`flap_baseline` refreshes lazily on the rollup tick, not via a nightly cron. Post-v0.4 correctness fixes added `migrations/04_summary_reset_ts.sql` and `migrations/05_platform_and_disabled_reason.sql` — see §4/§5.)
 
 Tests: `test_services.py` (reset/set_rated/export_log/recompute/disable round-trips), retention/fold idempotence test.
 
