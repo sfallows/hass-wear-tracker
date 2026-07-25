@@ -47,7 +47,16 @@ class AsyncSqliteWriter:
         conn.execute("PRAGMA synchronous = NORMAL")
         conn.execute("PRAGMA foreign_keys = ON")
         self._conn = conn
-        self._apply_migrations_sync()
+        try:
+            self._apply_migrations_sync()
+        except Exception:
+            # A failed migration must not leak the open connection: it holds the
+            # write lock, so a ConfigEntryNotReady retry (a fresh writer on the same
+            # DB file) would fail with 'database is locked' instead of surfacing the
+            # real error. Close it here so the lock is released before we re-raise.
+            conn.close()
+            self._conn = None
+            raise
 
     def _apply_migrations_sync(self) -> None:
         assert self._conn is not None
@@ -77,15 +86,33 @@ class AsyncSqliteWriter:
             for path in pending:
                 num = int(path.name[:2])
                 _LOG.info("wear_tracker: applying migration %s", path.name)
-                self._conn.executescript(path.read_text("utf-8"))
-                self._conn.execute(
-                    """
-                    INSERT INTO meta(key, value) VALUES ('schema_version', ?)
-                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
-                    """,
-                    (str(num),),
-                )
+                # Apply the migration and stamp schema_version in one transaction so
+                # a crash between the two can't leave a half-applied version that
+                # re-runs (and fails) on the next boot. executescript adds no
+                # transaction control of its own, so the migration files carry none
+                # and the wrapping BEGIN/COMMIT is supplied here.
+                try:
+                    self._conn.executescript(
+                        "BEGIN;\n"
+                        + path.read_text("utf-8")
+                        + "\nINSERT INTO meta(key, value) VALUES "
+                        f"('schema_version', '{num}')\n"
+                        "ON CONFLICT(key) DO UPDATE SET value = excluded.value;\n"
+                        "COMMIT;\n"
+                    )
+                except Exception:
+                    # A mid-script failure leaves the explicit BEGIN open. Roll it
+                    # back before re-raising, otherwise the finally's PRAGMA (a no-op
+                    # inside a transaction) is silently dropped and the connection
+                    # holds the write lock.
+                    if self._conn.in_transaction:
+                        self._conn.execute("ROLLBACK")
+                    raise
         finally:
+            # Defensive: never restore FK enforcement while a transaction is still
+            # open (the PRAGMA would be silently ignored there).
+            if self._conn.in_transaction:
+                self._conn.execute("ROLLBACK")
             self._conn.execute("PRAGMA foreign_keys = ON")
 
     async def close(self) -> None:
@@ -294,9 +321,14 @@ def reset_summary_sync(
             """,
             (ts, ts, entity_meta_id),
         )
-        # Re-arm event debounce: WEAR_CRITICAL_DEBOUNCE_S is effectively infinite,
-        # so a stale fired_ts would suppress wear_critical for the replaced device.
-        conn.execute("DELETE FROM events_fired WHERE entity_meta_id = ?", (entity_meta_id,))
+        # Re-arm wear_critical only: its debounce is effectively infinite, so a stale
+        # fired_ts would suppress the alert for the replaced device. Leave the
+        # flap/connection anomaly debounce rows intact so an in-progress flap doesn't
+        # immediately re-fire on the first rollup after a reset.
+        conn.execute(
+            "DELETE FROM events_fired WHERE entity_meta_id = ? AND event_kind = 'wear_critical'",
+            (entity_meta_id,),
+        )
         if not keep_history:
             conn.execute("DELETE FROM transitions WHERE entity_meta_id = ?", (entity_meta_id,))
             conn.execute("DELETE FROM daily_summary WHERE entity_meta_id = ?", (entity_meta_id,))
@@ -395,16 +427,30 @@ def fold_and_purge_sync(
     Returns the number of transition rows purged."""
     conn.execute("BEGIN")
     try:
+        # Only the reset DAY is dangerous to fold: recompute's transition replay is
+        # gated on ts >= reset_ts, but its daily_summary sum is gated on day >=
+        # reset_day, so a folded reset-day-morning row (ts < reset_ts, same day)
+        # would resurrect pre-reset counters. Prior days are the permanent archive
+        # keep_history exists to protect and must still fold. So exclude from folding
+        # only rows with ts < reset_ts that fall ON the reset day; fold everything
+        # else. (These rows are still purged below.)
         rows = conn.execute(
             """
-            SELECT entity_meta_id,
-                   strftime('%Y-%m-%d', ts, 'unixepoch') AS day,
-                   COALESCE(SUM(CASE WHEN from_state = 'ON' THEN delta_s ELSE 0 END), 0) AS on_seconds,
-                   COALESCE(SUM(CASE WHEN from_state != 'DISCONNECTED' THEN delta_s ELSE 0 END), 0) AS connected_seconds,
-                   COALESCE(SUM(CASE WHEN to_state = 'ON' AND from_state IN ('OFF', 'DISCONNECTED') AND delta_s >= ? THEN 1 ELSE 0 END), 0) AS cycles,
-                   COALESCE(SUM(CASE WHEN to_state = 'DISCONNECTED' AND from_state != 'DISCONNECTED' THEN 1 ELSE 0 END), 0) AS drops
-            FROM transitions WHERE ts < ?
-            GROUP BY entity_meta_id, day
+            SELECT t.entity_meta_id AS entity_meta_id,
+                   strftime('%Y-%m-%d', t.ts, 'unixepoch') AS day,
+                   COALESCE(SUM(CASE WHEN t.from_state = 'ON' THEN t.delta_s ELSE 0 END), 0) AS on_seconds,
+                   COALESCE(SUM(CASE WHEN t.from_state != 'DISCONNECTED' THEN t.delta_s ELSE 0 END), 0) AS connected_seconds,
+                   COALESCE(SUM(CASE WHEN t.to_state = 'ON' AND t.from_state IN ('OFF', 'DISCONNECTED') AND t.delta_s >= ? THEN 1 ELSE 0 END), 0) AS cycles,
+                   COALESCE(SUM(CASE WHEN t.to_state = 'DISCONNECTED' AND t.from_state != 'DISCONNECTED' THEN 1 ELSE 0 END), 0) AS drops
+            FROM transitions t
+            LEFT JOIN summary s ON s.entity_meta_id = t.entity_meta_id
+            WHERE t.ts < ?
+              AND (
+                  t.ts >= COALESCE(s.reset_ts, 0)
+                  OR strftime('%Y-%m-%d', t.ts, 'unixepoch')
+                     < strftime('%Y-%m-%d', COALESCE(s.reset_ts, 0), 'unixepoch')
+              )
+            GROUP BY t.entity_meta_id, day
             """,
             (debounce_s, cutoff_ts),
         ).fetchall()

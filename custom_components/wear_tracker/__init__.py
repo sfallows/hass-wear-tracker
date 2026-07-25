@@ -23,9 +23,10 @@ import voluptuous as vol
 
 from homeassistant.config_entries import SOURCE_IMPORT, ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP
-from homeassistant.core import Event, HomeAssistant
+from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.typing import ConfigType
 
 from . import discovery, services
@@ -38,6 +39,7 @@ from .const import (
     DB_SUBDIR,
     DOMAIN,
     PLATFORMS,
+    RELOAD_SUPPRESS,
 )
 from .coordinator import WearCoordinator
 from .storage import AsyncSqliteWriter
@@ -85,6 +87,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await writer.open()
     except Exception as err:
         _LOG.exception("wear_tracker: failed to open DB at %s", db_path)
+        # Close the writer so its executor (and any connection the open half-created)
+        # is released; otherwise the ConfigEntryNotReady retry below would race a
+        # leaked write lock and fail with 'database is locked' not the real error.
+        await writer.close()
         raise ConfigEntryNotReady(f"could not open {db_path}") from err
 
     coordinator = WearCoordinator(hass, writer, entry)
@@ -106,12 +112,77 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     async def _async_on_ha_stop(_event: Event) -> None:
         await coordinator.async_shutdown()
 
+    await _async_migrate_sensor_unique_ids(hass, entry, coordinator)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(_async_reload_on_update))
     entry.async_on_unload(
         hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _async_on_ha_stop)
     )
     return True
+
+
+async def _async_migrate_sensor_unique_ids(
+    hass: HomeAssistant, entry: ConfigEntry, coordinator: WearCoordinator
+) -> None:
+    """Rewrite pre-composite sensor/binary_sensor unique_ids to the new
+    platform-qualified roots in the HA entity registry (DESIGN §4). The old root
+    was the bare unique_id; `wear_sensor_root` now qualifies it with
+    platform+domain. Without this migration an upgrade would register every
+    sensor anew (as *_2), strand the originals' history/LTS, and break dashboards
+    and automations keyed on the old entity_ids."""
+    from .registry import wear_sensor_root
+    from .sensor import WearPercent, _SENSOR_CLASSES
+
+    keys = {cls.SENSOR_KEY for cls in _SENSOR_CLASSES}
+    keys |= {WearPercent.SENSOR_KEY, "health_alert"}
+
+    tracked = [
+        t
+        for t in (coordinator.get_tracked(eid) for eid in coordinator.tracked_entity_ids())
+        if t is not None
+    ]
+
+    def _old_roots(t) -> set[str]:
+        # Each entity may have been registered under either pre-composite root: the
+        # bare unique_id (rows that already had a unique_id) or the entity_id (rows
+        # with no unique_id pre-upgrade that got one backfilled this same boot).
+        roots = {t.entity_id}
+        if t.unique_id:
+            roots.add(t.unique_id)
+        return roots
+
+    # A root shared by two tracked entities was the very collision the new scheme
+    # fixes; it can't be attributed to either, so leave it alone.
+    old_root_counts: dict[str, int] = {}
+    for t in tracked:
+        for old_root in _old_roots(t):
+            old_root_counts[old_root] = old_root_counts.get(old_root, 0) + 1
+
+    remap: dict[str, str] = {}
+    for t in tracked:
+        new_root = wear_sensor_root(t)
+        for old_root in _old_roots(t):
+            if old_root == new_root or old_root_counts[old_root] > 1:
+                continue
+            for key in keys:
+                remap[f"wear_tracker_{old_root}_{key}"] = f"wear_tracker_{new_root}_{key}"
+    if not remap:
+        return
+
+    ent_reg = er.async_get(hass)
+
+    @callback
+    def _migrate(reg_entry: er.RegistryEntry) -> dict[str, str] | None:
+        new_uid = remap.get(reg_entry.unique_id)
+        if new_uid is None:
+            return None
+        # Don't rewrite onto a unique_id already taken (a partial prior migration,
+        # or the shared-root collision edge) — async_update_entity would raise.
+        if ent_reg.async_get_entity_id(reg_entry.domain, DOMAIN, new_uid):
+            return None
+        return {"new_unique_id": new_uid}
+
+    await er.async_migrate_entries(hass, entry.entry_id, _migrate)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -126,4 +197,11 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 async def _async_reload_on_update(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    # purge/purge_all update the options to drop the purged entities, then run their
+    # own awaited reload. Skip this listener's duplicate reload for that one update
+    # so a purge costs a single setup cycle. The token is one-shot (discarded here).
+    suppress = hass.data.get(RELOAD_SUPPRESS)
+    if suppress is not None and entry.entry_id in suppress:
+        suppress.discard(entry.entry_id)
+        return
     await hass.config_entries.async_reload(entry.entry_id)

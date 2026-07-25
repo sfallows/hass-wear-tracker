@@ -9,11 +9,12 @@
 --     wear_tracker.disable ('user', which stays disabled across restarts).
 --
 -- Relaxing the inline UNIQUE(unique_id) constraint requires rebuilding the
--- table. The migration runner disables foreign_keys around all migrations so the
--- DROP below doesn't cascade-delete the history tables that FK to
--- entity_meta(id); surrogate ids are preserved so the references stay valid.
+-- table. The migration runner wraps each migration (this rebuild plus its
+-- schema_version stamp) in one transaction and disables foreign_keys around it,
+-- so the DROP below doesn't cascade-delete the history tables that FK to
+-- entity_meta(id) and a partial apply rolls back cleanly; surrogate ids are
+-- preserved so the references stay valid.
 
-BEGIN;
 CREATE TABLE entity_meta_new (
     id              INTEGER PRIMARY KEY,
     unique_id       TEXT,
@@ -44,4 +45,3 @@ CREATE INDEX ix_entity_meta_active ON entity_meta(id) WHERE disabled = 0;
 -- NULLs compare distinct in a UNIQUE index, so legacy rows without a unique_id
 -- (or platform) are still allowed to coexist, matched by entity_id instead.
 CREATE UNIQUE INDEX ix_entity_meta_identity ON entity_meta(platform, domain, unique_id);
-COMMIT;

@@ -19,6 +19,7 @@ from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.event import (
+    async_call_later,
     async_track_state_change_event,
     async_track_time_interval,
 )
@@ -46,9 +47,12 @@ from .const import (
     FLAP_MIN_PER_HOUR,
     FLAP_RATIO,
     HEARTBEAT_INTERVAL_S,
+    RESTART_CREDIT_MAX_S,
     RESTART_GAP_TOLERANCE_S,
     RETENTION_DAYS,
     RETENTION_INTERVAL_S,
+    SEED_RETRY_INITIAL_S,
+    SEED_RETRY_MAX_S,
     SIGNAL_WEAR_UPDATED,
     TRACKABLE_DOMAINS,
     WEAR_CRITICAL_DEBOUNCE_S,
@@ -79,6 +83,19 @@ class WearCoordinator:
         self._source_device: dict[str, tuple[str, str] | None] = {}
         self._pending: set[asyncio.Task] = set()
         self._shutdown_started = False
+        # Set once the deferred seed has installed the state subscription; before
+        # then registry handlers must not install it (the seed will).
+        self._seeded = False
+        # True once the deferred seed loop has finished. While False, a live event
+        # that bootstraps a machine records its ts in _boot_observed so the seed can
+        # end that entity's restart credit at the bootstrap (no overlap with the live
+        # accrual that starts there) instead of skipping the credit entirely.
+        self._seed_complete = False
+        self._boot_observed: dict[str, int] = {}
+        # Captured at entry setup (before the slow boot-to-started delay) so the
+        # restart-gap tolerance is measured against the true offline gap.
+        self._setup_ts = 0
+        self._seed_retry_delay = SEED_RETRY_INITIAL_S
         self._discovery_mode = DISCOVERY_PROMPT
         self._excluded_domains: set[str] = set()
         self._excluded_entities: set[str] = set()
@@ -93,9 +110,11 @@ class WearCoordinator:
         self._unsub_registry: Callable[[], None] | None = None
         self._unsub_retention: Callable[[], None] | None = None
         self._unsub_started: Callable[[], None] | None = None
+        self._unsub_seed_retry: Callable[[], None] | None = None
 
     async def async_start(self, entity_ids: list[str]) -> None:
         now_ts = int(time.time())
+        self._setup_ts = now_ts
         if self.entry is not None:
             options = self.entry.options
             self._discovery_mode = options.get(CONF_DISCOVERY_MODE, DISCOVERY_PROMPT)
@@ -104,6 +123,17 @@ class WearCoordinator:
             self._include_binary_sensors = options.get(CONF_INCLUDE_BINARY_SENSORS, False)
         ent_reg = er.async_get(self.hass)
         dev_reg = dr.async_get(self.hass)
+        # The legacy NULL-platform fallback guard (registry.upsert) may only be
+        # blocked by an entity_id that belongs to a LIVE entity. A stale, dead-ghost
+        # id still lingering in CONF_ENTITIES must not refuse the fallback — that
+        # reintroduces the downtime-rename history fork (F6). "Live" = an entity
+        # registry entry present or a current state present.
+        known_ids = {
+            eid
+            for eid in entity_ids
+            if ent_reg.async_get(eid) is not None
+            or self.hass.states.get(eid) is not None
+        }
 
         for eid in entity_ids:
             state = self.hass.states.get(eid)
@@ -136,6 +166,7 @@ class WearCoordinator:
                     rated_hours=rated_hours,
                     rated_cycles=rated_cycles,
                     tracking_since=now_ts,
+                    known_entity_ids=known_ids,
                 )
             )
             self._tracked[eid] = tracked
@@ -163,29 +194,87 @@ class WearCoordinator:
     async def _async_seed_on_started(self) -> None:
         if self._shutdown_started:
             return
+        try:
+            await self._seed_once()
+        except Exception:
+            # A transient boot-time DB error (locked, disk full) would otherwise
+            # leave the integration frozen with no subscriptions and no retry; back
+            # off and try again instead of dying in this fire-and-forget task.
+            if self._shutdown_started:
+                return
+            delay = self._seed_retry_delay
+            if delay == SEED_RETRY_INITIAL_S:
+                _LOG.warning(
+                    "wear_tracker: seeding failed; retrying in %ss", delay, exc_info=True
+                )
+            else:
+                _LOG.debug("wear_tracker: seeding retry failed; retrying in %ss", delay)
+            self._seed_retry_delay = min(delay * 2, SEED_RETRY_MAX_S)
+            self._unsub_seed_retry = async_call_later(
+                self.hass, delay, self._seed_retry_fired
+            )
+
+    @callback
+    def _seed_retry_fired(self, _now) -> None:
+        self._unsub_seed_retry = None
+        if self._shutdown_started:
+            return
+        self._track_task(self._async_seed_on_started())
+
+    async def _seed_once(self) -> None:
+        # Install the state subscription first so state changes fired right at
+        # HA-started (startup automations) aren't dropped; observe()'s bootstrap
+        # handles events for entities the seed loop hasn't reached yet, and the loop
+        # skips any machine a live event already created so it isn't double-observed.
+        # async_shutdown unsubscribes this if it interleaves during the awaits below.
+        self._resubscribe_state()
+        self._seeded = True
         now_ts = int(time.time())
         last_alive = await self.writer.load_last_alive()
         mono = time.monotonic()
-        for eid, tracked in list(self._tracked.items()):
+        # Re-resolve tracked per iteration (not a stale pre-await snapshot): a rename
+        # or removal mid-seed pops/renames the key, and processing the dead key would
+        # fabricate a ghost DISCONNECTED machine and a bogus transition on the moved
+        # row's meta id. Skip disabled rows too (every live accrual path does).
+        for eid in list(self._tracked):
+            tracked = self._tracked.get(eid)
+            if tracked is None or tracked.disabled:
+                continue
             state = self.hass.states.get(eid)
             logical = derive_logical_state(state)
             raw = state.state if state else None
+            boot_ts = self._boot_observed.get(eid)
+            if boot_ts is not None:
+                # A live event already bootstrapped this machine mid-seed. Still apply
+                # the restart credit, but end it at the bootstrap ts so it doesn't
+                # overlap the live accrual that began there; don't observe again
+                # (that would double-record the bootstrap).
+                await self._recover_open_period(
+                    tracked, logical, now_ts, last_alive, credit_end=boot_ts
+                )
+                continue
+            if eid in self.state_machine.snapshot():
+                continue
             await self._recover_open_period(tracked, logical, now_ts, last_alive)
+            if eid in self.state_machine.snapshot():
+                continue
             ev = self.state_machine.observe(
                 eid, logical, raw, now_ts, mono, tracked.debounce_s
             )
             if ev is not None:
                 await self.writer.write_transition(tracked.id, ev)
 
+        self._seed_complete = True
+        self._boot_observed.clear()
+
         # Stamp a fresh heartbeat now that the restart-gap credit is applied, so a
         # second restart within the tolerance window recomputes the gap from this
         # boot rather than re-crediting the same downtime off the stale last_alive.
         await self.writer.heartbeat(now_ts)
         # async_shutdown may have run its unsub pass during the awaits above;
-        # installing subscriptions after it would leak them.
+        # installing the heartbeat timer after it would leak it.
         if self._shutdown_started:
             return
-        self._resubscribe_state()
         self._unsub_heartbeat = async_track_time_interval(
             self.hass,
             self._handle_heartbeat,
@@ -207,25 +296,39 @@ class WearCoordinator:
         logical: StateKind,
         now_ts: int,
         last_alive: int | None,
+        credit_end: int | None = None,
     ) -> None:
         """Credit a short downtime gap when a device was ON before the restart and
         is still ON now (DESIGN §4 — tolerate one missed heartbeat). Longer gaps are
-        left uncredited rather than inventing on-time across an unknown downtime."""
+        left uncredited rather than inventing on-time across an unknown downtime.
+
+        `credit_end` bounds the credited window's end (default seed-now); when a live
+        event bootstrapped the machine mid-seed it is the bootstrap ts, so the credit
+        stops where live accrual begins."""
         if logical is not StateKind.ON or last_alive is None:
             return
         summary = await self.writer.load_summary(tracked.id)
         if summary is None or summary.get("last_state") != _ON_STATE:
             return
-        gap = now_ts - last_alive
-        if 0 < gap <= RESTART_GAP_TOLERANCE_S:
-            await self.writer.apply_accruals(
-                [(tracked.id, float(gap), float(gap))], now_ts
-            )
-            _LOG.debug(
-                "wear_tracker: recovered %ss of on-time for %s across restart",
-                gap,
-                tracked.entity_id,
-            )
+        # Gate on the true offline gap measured at entry setup, not at seed-now:
+        # boot-to-started can be 100-150s on slow hosts, and measuring the gap here
+        # would blow the tolerance so the credit that matters most silently never
+        # applies. When the outage was short, credit the stayed-ON window
+        # (last_alive -> credit end), capped so a slow boot or seed-retry backoff
+        # can't fabricate many minutes if the device was toggled while unobserved.
+        offline_gap = self._setup_ts - last_alive
+        end = now_ts if credit_end is None else credit_end
+        if 0 < offline_gap <= RESTART_GAP_TOLERANCE_S:
+            credit = min(end - last_alive, RESTART_CREDIT_MAX_S)
+            if credit > 0:
+                await self.writer.apply_accruals(
+                    [(tracked.id, float(credit), float(credit))], now_ts
+                )
+                _LOG.debug(
+                    "wear_tracker: recovered %ss of on-time for %s across restart",
+                    credit,
+                    tracked.entity_id,
+                )
 
     @callback
     def _resubscribe_state(self) -> None:
@@ -234,6 +337,31 @@ class WearCoordinator:
         self._unsub_state = async_track_state_change_event(
             self.hass, list(self._tracked.keys()), self._handle_state_change
         )
+
+    @callback
+    def _observe_current_state(self, entity_id: str) -> None:
+        """Re-observe an entity's current real state after a rename so the machine
+        heals whatever the old id's state-removal / reconcile ordering was (the new
+        id's live change may have fired before it was tracked). Only heal from a
+        *present* state: if the new state hasn't landed yet, fabricating DISCONNECTED
+        here would record the very spurious drop the rename handling avoids — the
+        live subscription (now covering the new id) delivers the real state."""
+        tracked = self._tracked.get(entity_id)
+        if tracked is None or tracked.disabled:
+            return
+        state = self.hass.states.get(entity_id)
+        if state is None:
+            return
+        ev = self.state_machine.observe(
+            entity_id,
+            derive_logical_state(state),
+            state.state,
+            int(state.last_updated.timestamp()),
+            time.monotonic(),
+            tracked.debounce_s,
+        )
+        if ev is not None:
+            self._track_task(self._persist_and_signal(tracked.id, entity_id, ev))
 
     @callback
     def _track_task(self, coro) -> None:
@@ -254,17 +382,47 @@ class WearCoordinator:
             ts = int(new_state.last_updated.timestamp())
             raw = new_state.state
         else:
-            # Entity dropped out of the state machine (source integration reloaded
-            # or disabled). Treat as a disconnect so accrual stops instead of the
-            # in-memory machine staying ON and racking up phantom on-time.
-            ts = int(time.time())
-            raw = None
+            # new_state=None can mean the source integration dropped the state
+            # (reload/disable) OR a rename that removes the old entity_id before the
+            # coordinator's reconcile task runs OR a full removal. Only the first is
+            # a real disconnect; the others must not park the machine DISCONNECTED
+            # while the device is on (that halts accrual until the next real toggle).
+            ent_reg = er.async_get(self.hass)
+            if ent_reg.async_get(entity_id) is not None:
+                # ER entry for this entity_id survives → source dropped the state.
+                # Observe DISCONNECTED so accrual stops (deliberate reload/disable fix).
+                ts = int(time.time())
+                raw = None
+            else:
+                # ER entry for this entity_id is gone. If this identity now resolves to
+                # a DIFFERENT entity_id a rename is in flight (the reconcile will move
+                # the machine and re-observe) — skip, don't record a spurious drop.
+                # Otherwise it's a genuine removal (the registry removed-handler also
+                # observes DISCONNECTED; a same-state observe is a noop) or a legacy
+                # entity never in the ER: observe DISCONNECTED so a real state-drop is
+                # never skipped forever — an ER entry that vanished without a
+                # coordinator-visible event would otherwise leave a phantom ON.
+                moved_to = None
+                if tracked.platform is not None and tracked.unique_id is not None:
+                    moved_to = ent_reg.async_get_entity_id(
+                        tracked.domain, tracked.platform, tracked.unique_id
+                    )
+                if moved_to is not None and moved_to != entity_id:
+                    return
+                ts = int(time.time())
+                raw = None
         mono = time.monotonic()
+        seeding = not self._seed_complete
+        bootstrap = seeding and entity_id not in self.state_machine.snapshot()
         ev = self.state_machine.observe(
             entity_id, logical, raw, ts, mono, tracked.debounce_s
         )
         if ev is None:
             return
+        if bootstrap:
+            # Mid-seed live bootstrap: remember the observation ts so the seed loop
+            # ends this entity's restart credit here instead of overlapping accrual.
+            self._boot_observed[entity_id] = ev.ts
 
         self._track_task(self._persist_and_signal(tracked.id, entity_id, ev))
 
@@ -389,19 +547,39 @@ class WearCoordinator:
                 await self._handle_entity_renamed(old_entity_id, entity_id)
 
     async def _handle_entity_created(self, entity_id: str | None) -> None:
-        if not entity_id or entity_id in self._tracked:
+        if not entity_id:
+            return
+        # A disabled tracked entry counts as untracked here: after a restart between
+        # removal and re-pair, async_start puts the removal-disabled row back into
+        # _tracked, so a plain `entity_id in self._tracked` guard would swallow the
+        # re-pair and leave tracking frozen. Fall through so the re-registration
+        # schedules a reload (which resumes via the identity path).
+        existing = self._tracked.get(entity_id)
+        if existing is not None and not existing.disabled:
             return
         if entity_id in self._excluded_entities:
             return
         domain = entity_id.split(".", 1)[0]
-        if domain not in TRACKABLE_DOMAINS or domain in self._excluded_domains:
-            return
-        if domain == "binary_sensor" and not self._include_binary_sensors:
+        if domain in self._excluded_domains:
             return
         # Never track our own entities (e.g. binary_sensor.*_health_alert): doing
         # so would spawn sensors that re-trigger discovery in an unbounded loop.
         reg_entry = er.async_get(self.hass).async_get(entity_id)
         if reg_entry is not None and reg_entry.platform == DOMAIN:
+            return
+        # A configured entity that isn't currently tracked was live-removed (its row
+        # soft-disabled and popped) and is now re-created for the same entity_id.
+        # async_add_tracked_entities can't re-add it (already in CONF_ENTITIES), so
+        # schedule a reload to re-run the upsert/resume path — an identity match
+        # resumes counting without a full HA restart, in every discovery mode.
+        if self.entry is not None and entity_id in self.entry.options.get(
+            CONF_ENTITIES, []
+        ):
+            self.hass.config_entries.async_schedule_reload(self.entry.entry_id)
+            return
+        if domain not in TRACKABLE_DOMAINS:
+            return
+        if domain == "binary_sensor" and not self._include_binary_sensors:
             return
         if self._discovery_mode == DISCOVERY_AUTO_TRACK:
             await self.async_add_tracked_entities([entity_id])
@@ -438,7 +616,13 @@ class WearCoordinator:
             return
         for src, dst in moves:
             await self._apply_move(src, dst)
-        self._resubscribe_state()
+        # Pre-seed registry churn must not install the state subscription on unseeded
+        # machines (that fabricates cycles/drops from pre-started states); the seed
+        # installs it. After seeding, re-observe the new id's real state so the
+        # machine heals whatever the old id's state-removal / reconcile ordering was.
+        if self._seeded:
+            self._resubscribe_state()
+            self._observe_current_state(new_entity_id)
         _LOG.info("wear_tracker: entity renamed %s -> %s", old_entity_id, new_entity_id)
 
     async def _apply_move(self, src: str, dst: str) -> None:
@@ -460,12 +644,26 @@ class WearCoordinator:
         tracked = self._tracked.pop(entity_id, None)
         if tracked is None:
             return
+        # Close the final on/connected period and record the drop BEFORE tearing the
+        # machine down, so last_state lands DISCONNECTED and the last ON period isn't
+        # lost. If _handle_state_change's None-branch already observed DISCONNECTED
+        # (either event order is possible), this same-state observe returns None, so
+        # there is no double-record.
+        ev = self.state_machine.observe(
+            entity_id, StateKind.DISCONNECTED, None, int(time.time()),
+            time.monotonic(), tracked.debounce_s,
+        )
+        if ev is not None:
+            await self.writer.write_transition(tracked.id, ev)
         await self.writer.run(
             lambda conn: registry.set_disabled(conn, entity_id, True, "removed")
         )
         self.state_machine.reset(entity_id)
         self._source_device.pop(entity_id, None)
-        self._resubscribe_state()
+        # Only refresh the live subscription once the seed has installed it; before
+        # the seed runs it will pick up the post-churn tracked set itself.
+        if self._seeded:
+            self._resubscribe_state()
         _LOG.info(
             "wear_tracker: %s removed from registry; tracking paused (history kept)",
             entity_id,
@@ -481,12 +679,13 @@ class WearCoordinator:
             self._unsub_registry,
             self._unsub_retention,
             self._unsub_started,
+            self._unsub_seed_retry,
         ):
             if unsub is not None:
                 unsub()
         self._unsub_state = self._unsub_heartbeat = None
         self._unsub_registry = self._unsub_retention = None
-        self._unsub_started = None
+        self._unsub_started = self._unsub_seed_retry = None
         ts = int(time.time())
         if self._pending:
             await asyncio.gather(*list(self._pending), return_exceptions=True)

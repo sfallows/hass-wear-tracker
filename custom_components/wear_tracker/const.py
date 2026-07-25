@@ -24,6 +24,12 @@ DISCOVERY_MODES: Final = (DISCOVERY_PROMPT, DISCOVERY_AUTO_TRACK, DISCOVERY_OFF)
 
 SIGNAL_WEAR_UPDATED: Final = f"{DOMAIN}_wear_updated"
 
+# hass.data key holding a set of entry_ids whose next options-update-driven reload
+# should be suppressed (purge/purge_all run their own awaited reload, so the update
+# listener's duplicate reload is skipped once). Kept separate from hass.data[DOMAIN]
+# (the coordinator map) so it never confuses coordinator iteration.
+RELOAD_SUPPRESS: Final = f"{DOMAIN}_reload_suppress"
+
 EVENT_FLAP_ANOMALY: Final = f"{DOMAIN}.flap_anomaly"
 EVENT_CONNECTION_ANOMALY: Final = f"{DOMAIN}.connection_anomaly"
 EVENT_WEAR_CRITICAL: Final = f"{DOMAIN}.wear_critical"
@@ -51,6 +57,16 @@ WEAR_CRITICAL_DEBOUNCE_S: Final = 10**12  # effectively once per threshold
 # On restart, credit an in-progress ON period across the downtime gap only if the
 # gap since the last heartbeat is within this window (one missed beat tolerated).
 RESTART_GAP_TOLERANCE_S: Final = 2 * HEARTBEAT_INTERVAL_S
+
+# Hard cap on the seconds credited for a recovered restart on-period. A slow boot
+# or seed-retry backoff could otherwise fabricate many minutes of on-time if the
+# device was toggled externally during the unobserved window.
+RESTART_CREDIT_MAX_S: Final = 300
+
+# Deferred seeding retries itself on a transient boot-time DB error (previously a
+# ConfigEntryNotReady let HA retry with backoff); capped exponential backoff.
+SEED_RETRY_INITIAL_S: Final = 30
+SEED_RETRY_MAX_S: Final = 300
 
 TRACKABLE_DOMAINS: Final = frozenset(
     {

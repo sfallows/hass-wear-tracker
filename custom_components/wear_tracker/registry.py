@@ -55,12 +55,17 @@ def wear_sensor_root(entity: TrackedEntity) -> str:
     HA unique_ids are only unique per (platform, domain); two tracked entities
     that share a unique_id string across platforms would otherwise mint the same
     sensor unique_ids and reject the second. Qualify with platform+domain (both
-    stable across renames and re-pairs). Legacy entities without a unique_id keep
+    stable across renames and re-pairs) — but ONLY once platform is known. A row
+    with a unique_id but platform still NULL (pre-v5, before the first backfill)
+    returns the bare unique_id: that is exactly the old pre-composite root, so such
+    rows need no migration and mint no duplicates. When platform is later
+    backfilled the root changes to the qualified form and the setup migration
+    remaps the existing sensors in place. Legacy entities without a unique_id keep
     the entity_id root, which is already unique per install."""
     if entity.unique_id:
-        return "_".join(
-            p for p in (entity.platform, entity.domain, entity.unique_id) if p
-        )
+        if entity.platform:
+            return f"{entity.platform}_{entity.domain}_{entity.unique_id}"
+        return entity.unique_id
     return entity.entity_id
 
 
@@ -172,6 +177,7 @@ def upsert(
     rated_hours: float | None = None,
     rated_cycles: int | None = None,
     debounce_s: float = 2.0,
+    known_entity_ids: set[str] | None = None,
 ) -> TrackedEntity:
     """Insert if absent; return the persisted row.
 
@@ -181,14 +187,29 @@ def upsert(
     (e.g. the entity was renamed while we weren't listening, or a Zigbee device
     was re-paired), follow that row and update its mutable `entity_id` label.
     Otherwise match on `entity_id` and backfill identity if it was unknown.
-    Re-registering a removal-disabled row also resumes its tracking (DESIGN §4).
+    Re-registering a removal-disabled row resumes its tracking, but only on a
+    confirmed identity match (DESIGN §4).
+
+    `known_entity_ids`, when supplied by the caller (the full current tracked
+    set), guards the legacy NULL-platform fallback against stealing a row that
+    still belongs to a different live entity.
     """
     if unique_id is not None:
         by_id = load_by_identity(conn, platform, domain, unique_id)
         if by_id is None and platform is not None:
             # Pre-v5 rows have platform NULL until first backfill; without this a
             # rename during downtime would orphan the row and fork its history.
-            by_id = load_by_identity(conn, None, domain, unique_id)
+            # Guard: never seize a legacy row whose entity_id still belongs to a
+            # different live entity — otherwise, when two entities share a
+            # unique_id string across platforms, whichever upserts first would
+            # steal the other's history (DESIGN §4).
+            candidate = load_by_identity(conn, None, domain, unique_id)
+            if candidate is not None and not (
+                candidate.entity_id != entity_id
+                and known_entity_ids is not None
+                and candidate.entity_id in known_entity_ids
+            ):
+                by_id = candidate
         if by_id is not None:
             if by_id.entity_id != entity_id:
                 try:
@@ -206,14 +227,35 @@ def upsert(
             )
             return _resume_if_removed(conn, by_id)
 
+    # Bare entity_id match — identity is unconfirmed (no unique_id, or it matched
+    # no row). A removal-disabled row must NOT resume here: a plain reload upserts
+    # the stale entity_id with unique_id=None, and if that entity_id is later
+    # claimed by a different device its activity would accrue onto the old
+    # device's counters. Resume happens only on the identity path above (§4).
     existing = load_by_entity_id(conn, entity_id)
     if existing is not None:
-        existing = _backfill(
-            conn, existing, unique_id=unique_id, platform=platform,
-            manufacturer=manufacturer, model=model, rated_hours=rated_hours,
-            rated_cycles=rated_cycles,
-        )
-        return _resume_if_removed(conn, existing)
+        if (
+            existing.disabled
+            and existing.disabled_reason == "removed"
+            and unique_id is not None
+        ):
+            # A different identity is claiming the freed entity_id: the identity
+            # paths above already missed, so this unique_id is not the removed
+            # row's. Backfilling would forge the claimant's identity onto the old
+            # row (letting the next reload falsely resume it), and the entity_id
+            # UNIQUE constraint makes the INSERT below unreachable while the old row
+            # holds it. Retire the old row to a tombstone label (history FKs to its
+            # id, so it stays intact) and fall through to INSERT a fresh row.
+            conn.execute(
+                "UPDATE entity_meta SET entity_id = ? WHERE id = ?",
+                (f"{_RETIRED_PREFIX}{existing.id}__{entity_id}", existing.id),
+            )
+        else:
+            return _backfill(
+                conn, existing, unique_id=unique_id, platform=platform,
+                manufacturer=manufacturer, model=model, rated_hours=rated_hours,
+                rated_cycles=rated_cycles,
+            )
     conn.execute(
         """
         INSERT INTO entity_meta (
@@ -250,6 +292,9 @@ def set_disabled(
 
 
 _SENTINEL_PREFIX = "__wt_pending_"
+# Tombstone label for a removal-disabled row whose entity_id a different identity
+# reclaims; kept distinct from the swap sentinel so reconcile never treats it as one.
+_RETIRED_PREFIX = "__wt_retired_"
 
 
 def reconcile_rename(
@@ -279,6 +324,19 @@ def reconcile_rename(
         # can't supply the domain (older callers / tests).
         if target_domain is not None:
             row = load_by_identity(conn, target_platform, target_domain, target_unique_id)
+            if row is None and target_platform is not None:
+                # Pre-v5 rows have platform NULL, so the exact-platform lookup
+                # misses them and an A<->B swap would strand one row on a sentinel
+                # forever. Find them by the relaxed identity too, but only accept
+                # the row we're actually renaming (currently at old_entity_id) or
+                # one parked on a swap sentinel — never a different live entity
+                # that merely shares this unique_id (DESIGN §4).
+                candidate = load_by_identity(conn, None, target_domain, target_unique_id)
+                if candidate is not None and (
+                    candidate.entity_id == old_entity_id
+                    or candidate.entity_id.startswith(_SENTINEL_PREFIX)
+                ):
+                    row = candidate
         else:
             row = load_by_unique_id(conn, target_unique_id)
     if row is None:

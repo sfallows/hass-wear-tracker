@@ -32,6 +32,7 @@ from .const import (
     DEFAULT_DEBOUNCE_S,
     DISCOVERY_AUTO_TRACK,
     DOMAIN,
+    RELOAD_SUPPRESS,
     SIGNAL_WEAR_UPDATED,
 )
 
@@ -91,15 +92,14 @@ def async_register_services(hass: HomeAssistant) -> None:
         if coordinator.entry is not None:
             await hass.config_entries.async_reload(coordinator.entry.entry_id)
 
-    def _untrack_in_options(coordinator, entity_id: str, *, exclude: bool) -> bool:
+    def _untrack_in_options(coordinator, entity_id: str, *, exclude: bool) -> None:
         """Drop entity_id from the entry's tracked list so a reload can't re-track
         it. When `exclude` (auto_track mode), also add it to CONF_EXCLUDED_ENTITIES
         — otherwise scan_trackable would re-discover a still-existing entity on the
-        post-purge reload and undo the purge. Returns True when the entry changed
-        (which reloads via its update listener); False means the caller reloads."""
+        post-purge reload and undo the purge. The caller awaits the reload."""
         entry = coordinator.entry
         if entry is None:
-            return False
+            return
         entities = list(entry.options.get(CONF_ENTITIES, []))
         excluded = list(entry.options.get(CONF_EXCLUDED_ENTITIES, []))
         changed = False
@@ -110,7 +110,12 @@ def async_register_services(hass: HomeAssistant) -> None:
             excluded.append(entity_id)
             changed = True
         if not changed:
-            return False
+            return
+        # Suppress the update listener's reload: the caller runs its own awaited
+        # reload, so without this a purge costs two full setup cycles. Added only on
+        # the changed path (async_update_entry fires the listener only when the entry
+        # actually changes), so the one-shot token can't go stale.
+        hass.data.setdefault(RELOAD_SUPPRESS, set()).add(entry.entry_id)
         hass.config_entries.async_update_entry(
             entry,
             options={
@@ -119,7 +124,35 @@ def async_register_services(hass: HomeAssistant) -> None:
                 CONF_EXCLUDED_ENTITIES: excluded,
             },
         )
-        return True
+
+    def _untrack_all_in_options(coordinator, *, exclude: bool) -> None:
+        """purge_all analogue of _untrack_in_options: clear the whole tracked list
+        so the reload can't re-upsert zeroed rows, and in auto_track mode exclude
+        every currently-tracked entity so scan_trackable can't re-discover them.
+        The caller awaits the reload."""
+        entry = coordinator.entry
+        if entry is None:
+            return
+        prior_excluded = list(entry.options.get(CONF_EXCLUDED_ENTITIES, []))
+        excluded = list(prior_excluded)
+        if exclude:
+            for eid in coordinator.tracked_entity_ids():
+                if eid not in excluded:
+                    excluded.append(eid)
+        # Nothing to change (already no tracked entities and no new exclusions) means
+        # async_update_entry won't fire the listener; skip so no stale suppression
+        # token is left behind. The caller's awaited reload still runs.
+        if not entry.options.get(CONF_ENTITIES) and excluded == prior_excluded:
+            return
+        hass.data.setdefault(RELOAD_SUPPRESS, set()).add(entry.entry_id)
+        hass.config_entries.async_update_entry(
+            entry,
+            options={
+                **entry.options,
+                CONF_ENTITIES: [],
+                CONF_EXCLUDED_ENTITIES: excluded,
+            },
+        )
 
     async def handle_reset(call: ServiceCall) -> None:
         coordinator = _require_coordinator()
@@ -189,14 +222,18 @@ def async_register_services(hass: HomeAssistant) -> None:
         # DESIGN §9: purge is irreversible. Remove the entity from the entry's
         # tracked options so the reload doesn't re-upsert a fresh zeroed row and
         # resurrect the device; in auto_track also exclude it so scan_trackable
-        # can't re-discover a still-existing entity. Updating options already
-        # reloads via the update listener; only reload explicitly when unchanged.
+        # can't re-discover a still-existing entity.
         auto_track = (
             coordinator.entry is not None
             and coordinator.entry.options.get(CONF_DISCOVERY_MODE) == DISCOVERY_AUTO_TRACK
         )
-        if not _untrack_in_options(coordinator, entity_id, exclude=auto_track):
-            await _reload(coordinator)
+        _untrack_in_options(coordinator, entity_id, exclude=auto_track)
+        # Await the reload so the service returns only once the new coordinator
+        # (purged entity gone, sensors unregistered) is live — a blocking caller
+        # must never observe the stale one. async_update_entry's listener also
+        # reloads, but config-entry reloads serialize on entry.setup_lock, so
+        # awaiting our explicit reload deterministically leaves the new coordinator.
+        await _reload(coordinator)
 
     async def handle_purge_all(call: ServiceCall) -> None:
         coordinator = _require_coordinator()
@@ -205,6 +242,16 @@ def async_register_services(hass: HomeAssistant) -> None:
         ts = int(time.time())
         purged = await coordinator.writer.run(storage.purge_all_sync)
         await _audit(coordinator, None, "purge_all", {"purged": purged}, ts)
+        # DESIGN §9: purge_all is irreversible. Mirror handle_purge — clear the
+        # tracked options (and in auto_track exclude every tracked entity) so the
+        # reload can't re-upsert zeroed rows or re-discover still-existing entities
+        # and resurrect the devices, then await the reload so the service returns
+        # only once the purge-free coordinator is live.
+        auto_track = (
+            coordinator.entry is not None
+            and coordinator.entry.options.get(CONF_DISCOVERY_MODE) == DISCOVERY_AUTO_TRACK
+        )
+        _untrack_all_in_options(coordinator, exclude=auto_track)
         await _reload(coordinator)
         return {"purged": purged}
 

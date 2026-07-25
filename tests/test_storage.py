@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from datetime import datetime, timezone
 
 from _bootstrap import COMP, registry, storage
 from _bootstrap import state_machine as sm
@@ -144,6 +145,24 @@ def test_wear_sensor_root_falls_back_to_entity_id_without_unique_id():
     assert registry.wear_sensor_root(row) == "fan.attic"
 
 
+def test_wear_sensor_root_platform_null_uses_bare_unique_id():
+    """F13(a): a row with a unique_id but platform still NULL returns the bare
+    unique_id (the pre-composite root) — so such rows need no migration and mint no
+    duplicate sensors. Only once platform is known does it qualify."""
+    conn = _seed_conn()
+    row = registry.upsert(
+        conn, entity_id="light.a", domain="light", tracking_since=1, unique_id="uid-1"
+    )
+    assert row.platform is None
+    assert registry.wear_sensor_root(row) == "uid-1"
+    # Once platform is backfilled the root becomes the platform-qualified form.
+    row = registry.upsert(
+        conn, entity_id="light.a", domain="light", tracking_since=1,
+        unique_id="uid-1", platform="hue",
+    )
+    assert registry.wear_sensor_root(row) == "hue_light_uid-1"
+
+
 def test_removal_disabled_row_resumes_on_reupsert():
     """DESIGN §4: a soft-deleted (removed) row resumes tracking when the same
     unique_id re-registers (Zigbee re-pair)."""
@@ -218,6 +237,126 @@ def test_reconcile_rename_handles_simultaneous_swap():
     assert registry.load_by_unique_id(conn, "uid-a").entity_id == "light.b"
     assert registry.load_by_unique_id(conn, "uid-b").entity_id == "light.a"
     # Surrogate ids (and therefore history) are unchanged.
+    assert registry.load_by_entity_id(conn, "light.b").id == a.id
+    assert registry.load_by_entity_id(conn, "light.a").id == b.id
+
+
+def test_removal_disabled_row_does_not_resume_on_entity_id_only_match():
+    """Finding 2: a removed (soft-deleted) row must NOT resume on a bare entity_id
+    match — a plain reload upserts the stale entity_id with unique_id=None (the ER
+    entry is gone). Only a confirmed identity match may resume, so a freed
+    entity_id later claimed by a different device can't resurrect the old row."""
+    conn = _seed_conn()
+    row = registry.upsert(
+        conn, entity_id="light.a", domain="light", tracking_since=1,
+        unique_id="uid-a", platform="hue",
+    )
+    registry.set_disabled(conn, "light.a", True, "removed")
+    again = registry.upsert(conn, entity_id="light.a", domain="light", tracking_since=2)
+    assert again.id == row.id  # same row, matched by entity_id
+    assert again.disabled is True  # but tracking stays paused
+    assert again.disabled_reason == "removed"
+
+
+def test_removal_disabled_row_retired_when_different_identity_claims_entity_id():
+    """F1/F7: when a DIFFERENT identity (different unique_id) claims the freed
+    entity_id of a removal-disabled row, the old row is retired to a tombstone
+    (history kept, still disabled, identity NOT forged) and the claimant gets a
+    fresh, trackable row — rather than the claimant being untrackable (the entity_id
+    UNIQUE constraint made the INSERT unreachable) or the old row being resumed."""
+    conn = _seed_conn()
+    old = registry.upsert(
+        conn, entity_id="light.a", domain="light", tracking_since=1,
+        unique_id="uid-old", platform="hue",
+    )
+    storage.write_transition_sync(conn, old.id, _transition(StateKind.ON, life=10.0, cycles=1))
+    registry.set_disabled(conn, "light.a", True, "removed")
+
+    claimant = registry.upsert(
+        conn, entity_id="light.a", domain="light", tracking_since=2,
+        unique_id="uid-new", platform="hue",
+    )
+    assert claimant.id != old.id            # a fresh row, not the old one
+    assert claimant.disabled is False       # trackable
+    assert claimant.unique_id == "uid-new"
+    assert claimant.entity_id == "light.a"
+
+    retired = conn.execute(
+        "SELECT entity_id, unique_id, disabled, disabled_reason FROM entity_meta WHERE id = ?",
+        (old.id,),
+    ).fetchone()
+    assert retired["entity_id"].startswith("__wt_retired_")  # tombstone label
+    assert retired["unique_id"] == "uid-old"                 # NOT forged to claimant's
+    assert retired["disabled"] == 1 and retired["disabled_reason"] == "removed"
+    # History intact on the retired row.
+    assert conn.execute(
+        "SELECT lifetime_cycles FROM summary WHERE entity_meta_id = ?", (old.id,)
+    ).fetchone()[0] == 1
+
+    # The claimant is trackable: a fresh transition lands on its own row.
+    storage.write_transition_sync(conn, claimant.id, _transition(StateKind.ON, life=3.0, cycles=1))
+    assert conn.execute(
+        "SELECT lifetime_cycles FROM summary WHERE entity_meta_id = ?", (claimant.id,)
+    ).fetchone()[0] == 1
+
+
+def test_removal_disabled_row_ghost_reload_returns_unchanged():
+    """F1/F7: a ghost reload (bare entity_id, no unique_id — the ER entry is gone)
+    must still return the removal-disabled row unchanged, not retire it."""
+    conn = _seed_conn()
+    old = registry.upsert(
+        conn, entity_id="light.a", domain="light", tracking_since=1,
+        unique_id="uid-old", platform="hue",
+    )
+    registry.set_disabled(conn, "light.a", True, "removed")
+    again = registry.upsert(conn, entity_id="light.a", domain="light", tracking_since=2)
+    assert again.id == old.id
+    assert again.disabled is True and again.disabled_reason == "removed"
+    assert again.entity_id == "light.a"  # not retired to a tombstone
+
+
+def test_null_platform_fallback_does_not_steal_live_entitys_legacy_row():
+    """Finding 3: a legacy (platform NULL) row must not be seized by a different
+    entity that merely shares its unique_id string. With the full tracked set
+    known, the fallback is refused when the row's entity_id belongs to another
+    live entity, so the rightful owner keeps its history."""
+    conn = _seed_conn()
+    # Pre-v5 row for the entity currently at switch.a (platform never backfilled).
+    legacy = registry.upsert(
+        conn, entity_id="switch.a", domain="switch", tracking_since=1, unique_id="abc"
+    )
+    known = {"switch.a", "switch.b"}
+    # A different device sharing the unique_id string upserts first.
+    other = registry.upsert(
+        conn, entity_id="switch.b", domain="switch", tracking_since=1,
+        unique_id="abc", platform="tplink", known_entity_ids=known,
+    )
+    assert other.id != legacy.id  # got its own fresh row, not the legacy one
+    assert registry.load_by_entity_id(conn, "switch.a").id == legacy.id
+    assert registry.load_by_entity_id(conn, "switch.a").platform is None  # untouched
+    # The rightful owner later upserts and reclaims its legacy row: its entity_id
+    # matches the row's, so the guarded fallback accepts it.
+    owner = registry.upsert(
+        conn, entity_id="switch.a", domain="switch", tracking_since=2,
+        unique_id="abc", platform="acme", known_entity_ids=known,
+    )
+    assert owner.id == legacy.id
+    assert owner.platform == "acme"
+
+
+def test_reconcile_rename_finds_legacy_null_platform_row_in_swap():
+    """Finding 4: a pre-v5 (platform NULL) row must be found during a rename even
+    when the caller supplies platform+domain, so an A<->B swap doesn't strand one
+    row on a sentinel forever."""
+    conn = _seed_conn()
+    # Legacy rows: unique_id + entity_id known, platform never backfilled.
+    a = registry.upsert(conn, entity_id="light.a", domain="light", tracking_since=1, unique_id="uid-a")
+    b = registry.upsert(conn, entity_id="light.b", domain="light", tracking_since=1, unique_id="uid-b")
+    # Swap delivered as two events, each carrying the now-known platform+domain.
+    registry.reconcile_rename(conn, "light.a", "light.b", "uid-a", "hue", "light")
+    registry.reconcile_rename(conn, "light.b", "light.a", "uid-b", "hue", "light")
+    assert registry.load_by_unique_id(conn, "uid-a").entity_id == "light.b"
+    assert registry.load_by_unique_id(conn, "uid-b").entity_id == "light.a"
     assert registry.load_by_entity_id(conn, "light.b").id == a.id
     assert registry.load_by_entity_id(conn, "light.a").id == b.id
 
@@ -337,7 +476,7 @@ def test_reset_zeroes_summary_and_drops_history():
     assert conn.execute("SELECT COUNT(*) FROM transitions").fetchone()[0] == 0
 
 
-def test_reset_clears_events_fired():
+def test_reset_clears_wear_critical_keeps_anomaly_debounce():
     conn = _seed_conn()
     row = registry.upsert(conn, entity_id="light.a", domain="light", tracking_since=1)
     storage.write_transition_sync(conn, row.id, _transition(StateKind.ON, life=10.0, cycles=1))
@@ -346,12 +485,22 @@ def test_reset_clears_events_fired():
         " VALUES (?, 'wear_critical', 'hours:90', 1500)",
         (row.id,),
     )
-    # Cleared even with keep_history so wear_critical can re-arm for a replaced device.
+    # An in-progress flap/connection anomaly debounce that must survive the reset.
+    conn.execute(
+        "INSERT INTO events_fired (entity_meta_id, event_kind, discriminator, fired_ts)"
+        " VALUES (?, 'flap_anomaly', 'flap', 1500), (?, 'connection_anomaly', 'connection', 1500)",
+        (row.id, row.id),
+    )
+    # wear_critical is cleared even with keep_history so it can re-arm for a replaced
+    # device, but the anomaly debounce rows stay so ongoing flaps don't re-fire.
     storage.reset_summary_sync(conn, row.id, keep_history=True, ts=2000)
-    remaining = conn.execute(
-        "SELECT COUNT(*) FROM events_fired WHERE entity_meta_id=?", (row.id,)
-    ).fetchone()[0]
-    assert remaining == 0
+    kinds = {
+        r[0]
+        for r in conn.execute(
+            "SELECT event_kind FROM events_fired WHERE entity_meta_id=?", (row.id,)
+        ).fetchall()
+    }
+    assert kinds == {"flap_anomaly", "connection_anomaly"}
 
 
 def test_recompute_after_keep_history_reset_does_not_resurrect():
@@ -367,6 +516,142 @@ def test_recompute_after_keep_history_reset_does_not_resurrect():
     assert new["lifetime_seconds"] == 0.0
     assert new["lifetime_cycles"] == 0
     assert new["connection_drops"] == 0
+
+
+def test_fold_does_not_resurrect_reset_day_pre_reset_counters():
+    conn = _seed_conn()
+    row = registry.upsert(conn, entity_id="light.a", domain="light", tracking_since=1)
+    day_start = int(datetime(2026, 7, 10, tzinfo=timezone.utc).timestamp())
+    pre_reset_ts = day_start + 8 * 3600    # 08:00, before the reset
+    reset_ts = day_start + 15 * 3600       # 15:00 reset
+    post_reset_ts = day_start + 16 * 3600  # 16:00, after the reset, same day
+    # Live-accumulated summary before the reset, plus the transition that made it.
+    conn.execute(
+        "INSERT INTO summary (entity_meta_id, lifetime_seconds, connected_seconds,"
+        " lifetime_cycles, connection_drops, updated_ts) VALUES (?, 1000.0, 1000.0, 0, 1, ?)",
+        (row.id, pre_reset_ts),
+    )
+    _raw_transition(conn, row.id, pre_reset_ts, "ON", "DISCONNECTED", 1000.0)
+    storage.reset_summary_sync(conn, row.id, keep_history=True, ts=reset_ts)
+    # A legitimate post-reset on-period on the same calendar day as the reset.
+    _raw_transition(conn, row.id, post_reset_ts, "ON", "OFF", 500.0)
+    # Retention fold ~90 days later: pre-reset rows are purged, not folded, so the
+    # reset-day daily_summary row only ever holds post-reset amounts.
+    cutoff = day_start + 100 * 24 * 3600
+    storage.fold_and_purge_sync(conn, cutoff_ts=cutoff, debounce_s=2.0)
+    assert conn.execute("SELECT COUNT(*) FROM transitions").fetchone()[0] == 0
+    daily = conn.execute(
+        "SELECT on_seconds, drops FROM daily_summary WHERE entity_meta_id=? AND day='2026-07-10'",
+        (row.id,),
+    ).fetchone()
+    assert daily["on_seconds"] == 500.0  # only the post-reset period, not 1500
+    assert daily["drops"] == 0           # the pre-reset drop was purged, not folded
+    new = storage.recompute_summary_sync(conn, row.id, 2.0)
+    assert new["lifetime_seconds"] == 500.0
+    assert new["connection_drops"] == 0
+
+
+def test_fold_folds_prior_days_but_not_reset_day_pre_reset():
+    """F2: keep_history's permanent daily archive for days BEFORE the reset day must
+    still be folded; only reset-day-morning pre-reset rows are excluded from folding
+    (they would let recompute's day>=reset_day filter resurrect pre-reset counters).
+    Prior-day folds are kept for audit but recompute (gated at reset_ts) ignores
+    them, so a reset still can't be resurrected."""
+    conn = _seed_conn()
+    row = registry.upsert(conn, entity_id="light.a", domain="light", tracking_since=1)
+    day_start = int(datetime(2026, 7, 10, tzinfo=timezone.utc).timestamp())
+    prior_day_ts = int(datetime(2026, 7, 8, 10, tzinfo=timezone.utc).timestamp())
+    reset_morning_ts = day_start + 8 * 3600    # 08:00 reset day, pre-reset
+    reset_ts = day_start + 15 * 3600           # 15:00 reset
+    post_reset_ts = day_start + 16 * 3600      # 16:00 reset day, post-reset
+    # A summary row must exist for reset_summary_sync to stamp reset_ts onto.
+    conn.execute(
+        "INSERT INTO summary (entity_meta_id, lifetime_seconds, connected_seconds,"
+        " lifetime_cycles, connection_drops, updated_ts) VALUES (?, 0, 0, 0, 0, ?)",
+        (row.id, prior_day_ts),
+    )
+    _raw_transition(conn, row.id, prior_day_ts, "ON", "OFF", 700.0)              # prior day -> fold
+    _raw_transition(conn, row.id, reset_morning_ts, "ON", "DISCONNECTED", 300.0)  # reset day am -> NOT fold
+    storage.reset_summary_sync(conn, row.id, keep_history=True, ts=reset_ts)
+    _raw_transition(conn, row.id, post_reset_ts, "ON", "OFF", 500.0)             # reset day pm -> fold
+    cutoff = day_start + 100 * 24 * 3600
+    storage.fold_and_purge_sync(conn, cutoff_ts=cutoff, debounce_s=2.0)
+    assert conn.execute("SELECT COUNT(*) FROM transitions").fetchone()[0] == 0
+
+    prior = conn.execute(
+        "SELECT on_seconds FROM daily_summary WHERE entity_meta_id=? AND day='2026-07-08'",
+        (row.id,),
+    ).fetchone()
+    assert prior is not None and prior["on_seconds"] == 700.0  # prior-day archive kept
+
+    reset_day = conn.execute(
+        "SELECT on_seconds, drops FROM daily_summary WHERE entity_meta_id=? AND day='2026-07-10'",
+        (row.id,),
+    ).fetchone()
+    assert reset_day["on_seconds"] == 500.0  # post-reset only, morning 300s excluded
+    assert reset_day["drops"] == 0           # the reset-morning drop was purged, not folded
+
+    new = storage.recompute_summary_sync(conn, row.id, 2.0)
+    assert new["lifetime_seconds"] == 500.0  # prior-day fold not resurrected
+    assert new["connection_drops"] == 0
+
+
+def test_failed_migration_rolls_back_and_releases_lock(tmp_path, monkeypatch):
+    """F8: a migration that raises mid-script must roll back its own BEGIN and close
+    the connection, so a ConfigEntryNotReady retry (a fresh writer on the same DB)
+    surfaces the real error, not 'database is locked' from a leaked write lock."""
+    db = tmp_path / "wear.db"
+    migrations = tmp_path / "migrations"
+    migrations.mkdir()
+    (migrations / "01_broken.sql").write_text(
+        "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);\n"
+        "CREATE TABLE good (id INTEGER);\n"
+        "INSERT INTO does_not_exist (x) VALUES (1);\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(storage, "MIGRATIONS_DIR", migrations)
+
+    async def scenario():
+        w1 = storage.AsyncSqliteWriter(db)
+        err1 = None
+        try:
+            await w1.open()
+        except Exception as e:  # noqa: BLE001
+            err1 = e
+        # The failed open closed its connection (released the write lock).
+        assert w1._conn is None
+        # Open a fresh writer on the same DB BEFORE closing w1, so a leaked lock (if
+        # the fix regressed) would actually collide here.
+        w2 = storage.AsyncSqliteWriter(db)
+        err2 = None
+        try:
+            await w2.open()
+        except Exception as e:  # noqa: BLE001
+            err2 = e
+        await w1.close()
+        await w2.close()
+        return err1, err2
+
+    err1, err2 = asyncio.run(scenario())
+    assert err1 is not None and "database is locked" not in str(err1).lower()
+    assert err2 is not None and "database is locked" not in str(err2).lower()
+
+
+def test_open_leaves_foreign_keys_on(tmp_path):
+    """F8: the runner disables FK during table-rebuild migrations (04/05); the
+    finally must restore enforcement (not be silently skipped inside an open
+    transaction) so live cascades (purge) work afterwards."""
+    async def scenario():
+        writer = storage.AsyncSqliteWriter(tmp_path / "wear.db")
+        await writer.open()
+        try:
+            return await writer.run(
+                lambda c: c.execute("PRAGMA foreign_keys").fetchone()[0]
+            )
+        finally:
+            await writer.close()
+
+    assert asyncio.run(scenario()) == 1
 
 
 def test_recompute_ignores_restart_seed_disconnect_rows():
@@ -410,6 +695,40 @@ def test_migrations_set_schema_version(tmp_path):
     async def scenario():
         writer = storage.AsyncSqliteWriter(tmp_path / "wear.db")
         await writer.open()
+        try:
+            return await writer.run(
+                lambda c: c.execute(
+                    "SELECT value FROM meta WHERE key='schema_version'"
+                ).fetchone()[0]
+            )
+        finally:
+            await writer.close()
+
+    assert asyncio.run(scenario()) == "5"
+
+
+def test_reopen_after_crash_between_apply_and_stamp_does_not_brick(tmp_path):
+    """A crash after a migration applies but before schema_version is stamped must
+    not brick the next boot (04's ADD COLUMN would otherwise re-run and fail with
+    'duplicate column name'). Simulate: apply 04's column then leave version at 3."""
+    db = tmp_path / "wear.db"
+    # Bring the DB up through migration 03 only, stamped at version 3.
+    conn = sqlite3.connect(db, isolation_level=None)
+    for sql in sorted((COMP / "migrations").glob("[0-9][0-9]_*.sql")):
+        if int(sql.name[:2]) > 3:
+            break
+        conn.executescript(sql.read_text("utf-8"))
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES ('schema_version', '3')"
+        " ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+    )
+    # 04 partially applied (column added) but its schema_version stamp never landed.
+    conn.execute("ALTER TABLE summary ADD COLUMN reset_ts INTEGER")
+    conn.close()
+
+    async def scenario():
+        writer = storage.AsyncSqliteWriter(db)
+        await writer.open()  # must not raise 'duplicate column name'
         try:
             return await writer.run(
                 lambda c: c.execute(
