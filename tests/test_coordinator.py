@@ -20,6 +20,7 @@ from homeassistant.const import (  # noqa: E402
     EntityCategory,
 )
 from homeassistant.core import CoreState  # noqa: E402
+from homeassistant.helpers import device_registry as dr  # noqa: E402
 from homeassistant.helpers import entity_registry as er  # noqa: E402
 from homeassistant.util import dt as dt_util  # noqa: E402
 from pytest_homeassistant_custom_component.common import (  # noqa: E402
@@ -83,6 +84,73 @@ async def test_creates_sensors_per_entity(hass, enable_custom_integrations):
     ]
     assert len(health) == 1
     assert health[0].unique_id.endswith("_health_alert")
+
+
+async def test_sensors_link_to_the_source_device(hass, enable_custom_integrations, caplog):
+    # A tracked entity that belongs to a device: every wear entity must be created
+    # and its wear device must point at that source device via via_device_id.
+    # The deprecated `via_device` usually only logs here (it can also raise), but on
+    # HA 2026.11 it failed to add every device-backed wear entity, so its warning
+    # fails the test too.
+    source_entry = MockConfigEntry(domain="demo")
+    source_entry.add_to_hass(hass)
+    source = dr.async_get(hass).async_get_or_create(
+        config_entry_id=source_entry.entry_id,
+        identifiers={("demo", "bulb-1")},
+        manufacturer="Signify",
+        model="Hue White",
+    )
+    er.async_get(hass).async_get_or_create(
+        "light", "demo", "bulb-1", suggested_object_id="porch", device_id=source.id
+    )
+    hass.states.async_set("light.porch", "on")
+    await _setup_entry(hass, {"entities": ["light.porch"], "discovery_mode": "off"})
+
+    wear = [
+        e for e in er.async_get(hass).entities.values() if e.platform == DOMAIN
+    ]
+    assert len([e for e in wear if e.domain == "binary_sensor"]) == 1
+    assert len([e for e in wear if e.domain == "sensor"]) >= 8
+    device_ids = {e.device_id for e in wear}
+    assert len(device_ids) == 1
+    wear_device = dr.async_get(hass).async_get(device_ids.pop())
+    assert wear_device.via_device_id == source.id
+    assert "deprecated `via_device`" not in caplog.text
+
+
+async def test_child_device_source_links_to_its_parent(hass, enable_custom_integrations):
+    # A child device can't be a via device, so the wear device links to the parent,
+    # and the rated-life lookup reads the parent's manufacturer and model.
+    source_entry = MockConfigEntry(domain="demo")
+    source_entry.add_to_hass(hass)
+    reg = dr.async_get(hass)
+    parent = reg.async_get_or_create(
+        config_entry_id=source_entry.entry_id,
+        identifiers={("demo", "relay")},
+        manufacturer="Shelly",
+        model="Pro 4PM",
+    )
+    child = reg.async_get_or_create_child(
+        config_entry_id=source_entry.entry_id,
+        identifiers={("demo", "relay-ch1")},
+        parent_device_id=parent.id,
+        name="ch1",
+    )
+    er.async_get(hass).async_get_or_create(
+        "switch", "demo", "ch1", suggested_object_id="pump", device_id=child.id
+    )
+    hass.states.async_set("switch.pump", "on")
+    _entry, coordinator = await _setup_entry(
+        hass, {"entities": ["switch.pump"], "discovery_mode": "off"}
+    )
+
+    wear = [e for e in er.async_get(hass).entities.values() if e.platform == DOMAIN]
+    assert len([e for e in wear if e.domain == "binary_sensor"]) == 1
+    assert len([e for e in wear if e.domain == "sensor"]) >= 8
+    wear_device = reg.async_get(wear[0].device_id)
+    assert wear_device.via_device_id == parent.id
+    tracked = coordinator.get_tracked("switch.pump")
+    assert (tracked.manufacturer, tracked.model) == ("Shelly", "Pro 4PM")
 
 
 async def test_rename_follows_the_entity(hass, enable_custom_integrations):

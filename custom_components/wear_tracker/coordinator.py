@@ -80,7 +80,7 @@ class WearCoordinator:
         self.entry = entry
         self.state_machine = EntityStateMachine()
         self._tracked: dict[str, registry.TrackedEntity] = {}
-        self._source_device: dict[str, tuple[str, str] | None] = {}
+        self._source_device: dict[str, str | None] = {}
         self._pending: set[asyncio.Task] = set()
         self._shutdown_started = False
         # Set once the deferred seed has installed the state subscription; before
@@ -145,9 +145,7 @@ class WearCoordinator:
             device = self._source_device_entry(dev_reg, entry)
             manufacturer = device.manufacturer if device else None
             model = device.model if device else None
-            self._source_device[eid] = (
-                next(iter(device.identifiers)) if device and device.identifiers else None
-            )
+            self._source_device[eid] = device.id if device else None
             rated = lookup_rated(manufacturer, model)
             rated_hours = rated.rated_hours if rated else None
             rated_cycles = rated.rated_cycles if rated else None
@@ -288,7 +286,13 @@ class WearCoordinator:
     ) -> dr.DeviceEntry | None:
         if entry is None or entry.device_id is None:
             return None
-        return dev_reg.async_get(entry.device_id)
+        device = dev_reg.async_get(entry.device_id)
+        # A child device (HA 2026.10+) can't be a via device and carries no
+        # manufacturer/model, so use its parent for both.
+        parent_id = getattr(device, "parent_device_id", None)
+        if parent_id is not None:
+            return dev_reg.async_get(parent_id)
+        return device
 
     async def _recover_open_period(
         self,
@@ -716,7 +720,7 @@ class WearCoordinator:
     def get_tracked(self, entity_id: str) -> registry.TrackedEntity | None:
         return self._tracked.get(entity_id)
 
-    def get_source_device(self, entity_id: str) -> tuple[str, str] | None:
+    def get_source_device(self, entity_id: str) -> str | None:
         return self._source_device.get(entity_id)
 
     def get_rates(self, meta_id: int) -> dict[str, float] | None:

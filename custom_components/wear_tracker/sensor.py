@@ -39,7 +39,7 @@ class _WearBaseSensor(SensorEntity):
         self,
         coordinator: WearCoordinator,
         tracked: TrackedEntity,
-        via_device: tuple[str, str] | None = None,
+        via_device_id: str | None = None,
     ) -> None:
         self._coordinator = coordinator
         self._tracked = tracked
@@ -52,8 +52,8 @@ class _WearBaseSensor(SensorEntity):
             manufacturer=tracked.manufacturer,
             model=tracked.model,
         )
-        if via_device is not None:
-            device_info["via_device"] = via_device
+        if via_device_id is not None:
+            device_info["via_device_id"] = via_device_id
         self._attr_device_info = device_info
 
     async def async_added_to_hass(self) -> None:
@@ -240,8 +240,8 @@ async def async_setup_entry(
         tracked = coordinator.get_tracked(eid)
         if tracked is None:
             continue
-        via_device = coordinator.get_source_device(eid)
-        entities.extend(cls(coordinator, tracked, via_device) for cls in _SENSOR_CLASSES)
+        via_device_id = coordinator.get_source_device(eid)
+        entities.extend(cls(coordinator, tracked, via_device_id) for cls in _SENSOR_CLASSES)
         if tracked.rated_hours or tracked.rated_cycles:
-            entities.append(WearPercent(coordinator, tracked, via_device))
+            entities.append(WearPercent(coordinator, tracked, via_device_id))
     async_add_entities(entities)

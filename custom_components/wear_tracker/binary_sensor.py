@@ -29,7 +29,7 @@ class HealthAlertBinarySensor(BinarySensorEntity):
         self,
         coordinator: WearCoordinator,
         tracked: TrackedEntity,
-        via_device: tuple[str, str] | None = None,
+        via_device_id: str | None = None,
     ) -> None:
         self._coordinator = coordinator
         self._meta_id = tracked.id
@@ -40,8 +40,8 @@ class HealthAlertBinarySensor(BinarySensorEntity):
             manufacturer=tracked.manufacturer,
             model=tracked.model,
         )
-        if via_device is not None:
-            device_info["via_device"] = via_device
+        if via_device_id is not None:
+            device_info["via_device_id"] = via_device_id
         self._attr_device_info = device_info
 
     async def async_added_to_hass(self) -> None:

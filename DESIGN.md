@@ -246,7 +246,7 @@ Each sensor entity is registered with HA's long-term statistics (LTS) and histor
 
 `total_increasing` sensors have exactly one legitimate decrease path: the `wear_tracker.reset` service, which also clears the corresponding LTS series via `recorder.get_instance(hass).async_clear_statistics` (an internal API — the whole call is wrapped defensively so a missing/renamed recorder API just logs at DEBUG and leaves the series alone). It matches this entity's **own** sensor unique_ids exactly (not a name prefix), so resetting `switch.pump` can't wipe the statistics of a sibling like `switch.pump_2`. `recompute` enforces the never-decrease floor described in §5.
 
-All wear sensors set `entity_category = DIAGNOSTIC` so they default off the main dashboard, and use `device_info(via_device=...)` to attach to the source entity's device.
+All wear sensors set `entity_category = DIAGNOSTIC` so they default off the main dashboard, and use `device_info(via_device_id=...)` (the source device's registry id) to attach to the source entity's device.
 
 Each sensor's unique_id is `wear_tracker_<root>_<key>`, where `root` (`registry.wear_sensor_root`) is `platform_domain_uniqueid` when the platform is known, the bare `unique_id` when the row has one but platform is still `NULL`, else the `entity_id`. Because the composite-identity work (see §4) changed this root, `async_setup_entry` runs an entity-registry migration on every boot that remaps both old root forms in place — so upgrades keep their existing sensor `entity_id`s and LTS series instead of re-registering everything as `*_2`.
 
